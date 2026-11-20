@@ -61,23 +61,26 @@ def set_auth_cookies(response: Response, access_token: str, refresh_token: str):
     samesite_val = "none" if is_prod else "lax"
     secure_val = True if is_prod else False
 
-    # Set access token cookie (15 mins)
+    access_max_age = settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60
+    refresh_max_age = settings.REFRESH_TOKEN_EXPIRE_DAYS * 24 * 60 * 60
+
+    # Set access token cookie
     response.set_cookie(
         key="access_token",
         value=access_token,
         httponly=True,
-        max_age=15 * 60,
-        expires=15 * 60,
+        max_age=access_max_age,
+        expires=access_max_age,
         samesite=samesite_val,
         secure=secure_val
     )
-    # Set refresh token cookie (7 days)
+    # Set refresh token cookie
     response.set_cookie(
         key="refresh_token",
         value=refresh_token,
         httponly=True,
-        max_age=7 * 24 * 60 * 60,
-        expires=7 * 24 * 60 * 60,
+        max_age=refresh_max_age,
+        expires=refresh_max_age,
         samesite=samesite_val,
         secure=secure_val
     )
@@ -348,13 +351,14 @@ async def refresh(request: Request, response: Response):
         is_prod = not settings.DEBUG
         samesite_val = "none" if is_prod else "lax"
         secure_val = True if is_prod else False
+        access_max_age = settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60
         
         response.set_cookie(
             key="access_token",
             value=new_access_token,
             httponly=True,
-            max_age=15 * 60,
-            expires=15 * 60,
+            max_age=access_max_age,
+            expires=access_max_age,
             samesite=samesite_val,
             secure=secure_val
         )
