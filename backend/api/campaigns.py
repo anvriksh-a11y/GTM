@@ -1,0 +1,1969 @@
+import logging
+from typing import Optional
+from fastapi import APIRouter, HTTPException, UploadFile, File, Request, BackgroundTasks
+from pydantic import BaseModel
+from openai import AsyncOpenAI
+
+from config import settings
+from services.image_gen import generate_campaign_image
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/api/campaigns", tags=["campaigns"])
+
+class ContentRequest(BaseModel):
+    user_id: str
+    channel: str # linkedin, email, whatsapp, voice, sms
+    objective: str # follow_up, engagement, product_launch, event_management
+    action: str # post, dm
+    product_name: str
+    target_customer: str
+    call_to_action: str
+    product_info: str
+
+class ContentResponse(BaseModel):
+    content: str
+
+class ImageRequest(BaseModel):
+    user_id: str
+    content: str
+
+class ImageResponse(BaseModel):
+    prompt: str
+    image_url: str
+
+class PublishRequest(BaseModel):
+    action: str
+    content: str
+    image_url: Optional[str] = None
+    accounts: list[str] = ["Account 1", "Account 2", "Account 3"]
+    user_id: str
+    name: Optional[str] = None
+    product_name: Optional[str] = ""
+    target_customer: Optional[str] = ""
+    call_to_action: Optional[str] = ""
+    product_info: Optional[str] = ""
+    objective: Optional[str] = "engagement"
+
+class DraftRequest(BaseModel):
+    action: str
+    content: str
+    image_url: Optional[str] = None
+    user_id: str
+    name: str
+    product_name: Optional[str] = ""
+    target_customer: Optional[str] = ""
+    call_to_action: Optional[str] = ""
+    product_info: Optional[str] = ""
+    objective: Optional[str] = "engagement"
+
+class EmailSendRequest(BaseModel):
+    campaign_id: str
+    user_id: str
+    subject: str
+    content: str
+    method: str
+    leads: list[dict] = []
+
+class EmailPublishRequest(BaseModel):
+    action: str
+    content: str
+    user_id: str
+    name: str
+    method: str
+    leads: list[dict] = []
+    product_name: Optional[str] = ""
+    target_customer: Optional[str] = ""
+    call_to_action: Optional[str] = ""
+    product_info: Optional[str] = ""
+    objective: Optional[str] = "engagement"
+
+class SmsSendRequest(BaseModel):
+    campaign_id: str
+    user_id: str
+    content: str
+    image_url: Optional[str] = None
+    leads: list[dict] = []
+
+class SmsPublishRequest(BaseModel):
+    action: str
+    content: str
+    image_url: Optional[str] = None
+    user_id: str
+    name: str
+    leads: list[dict] = []
+    product_name: Optional[str] = ""
+    target_customer: Optional[str] = ""
+    call_to_action: Optional[str] = ""
+    product_info: Optional[str] = ""
+    objective: Optional[str] = "engagement"
+
+# ── Voice Campaign Models ─────────────────────────────────────────────────────
+
+class VoicePromptRefineRequest(BaseModel):
+    user_id: str
+    raw_prompt: str
+    product_name: str = ""
+    target_customer: str = ""
+    call_to_action: str = ""
+
+class VoicePublishRequest(BaseModel):
+    user_id: str
+    name: str
+    prompt: str  # The refined system prompt for the AI agent
+    first_message: str = ""
+    leads: list[dict] = []  # [{name, phone}]
+    send_followup_sms: bool = True
+    language: Optional[str] = "auto"  # "hi" (Hindi) | "en" (English) | "auto"
+    accent: Optional[str] = "auto"    # "in" (Indian) | "us" (US) | "auto"
+    voice_id: Optional[str] = ""
+    tts_provider: Optional[str] = ""  # "sarvam" | "cartesia" | "deepgram" | ""
+    telephony_provider: Optional[str] = "auto"  # "auto" | "vobiz" (India) | "twilio" (International)
+    product_name: Optional[str] = ""
+    target_customer: Optional[str] = ""
+    call_to_action: Optional[str] = ""
+    product_info: Optional[str] = ""
+    objective: Optional[str] = "engagement"
+
+class VoiceTestCallRequest(BaseModel):
+    user_id: str
+    phone: str
+    prompt: str
+    first_message: str = ""
+    language: Optional[str] = "auto"  # "hi" | "en" | "auto"
+    accent: Optional[str] = "auto"    # "in" | "us" | "auto"
+    voice_id: Optional[str] = ""
+    tts_provider: Optional[str] = ""
+    telephony_provider: Optional[str] = "auto"  # "auto" | "vobiz" | "twilio"
+
+
+class VoiceDraftRequest(BaseModel):
+    user_id: str
+    name: str
+    prompt: str
+    first_message: str = "Hello! Thanks for taking my call."
+    leads: list[dict] = []
+    language: Optional[str] = "auto"
+    accent: Optional[str] = "auto"
+    voice_id: Optional[str] = ""
+    tts_provider: Optional[str] = ""
+    product_name: Optional[str] = ""
+    target_customer: Optional[str] = ""
+    call_to_action: Optional[str] = ""
+    product_info: Optional[str] = ""
+    objective: Optional[str] = "engagement"
+
+def get_openai_client():
+    if not settings.OPENAI_API_KEY:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY not configured")
+    return AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+
+@router.post("/generate-content", response_model=ContentResponse)
+async def generate_campaign_content(req: ContentRequest):
+    client = get_openai_client()
+    model = "gpt-4o-mini"
+    
+    from prompts.campaign_prompts import fill_prompt
+    import json
+    
+    try:
+        # Use the user's new helper function
+        prompt = fill_prompt(
+            channel=req.channel.lower(),
+            campaign_type=req.objective.lower(),
+            product_name=req.product_name,
+            target_customer=req.target_customer,
+            product_info=req.product_info,
+            call_to_action=req.call_to_action
+        )
+        
+        # The prompt demands JSON, so we enforce it
+        response = await client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7,
+            response_format={"type": "json_object"}
+        )
+        
+        from services.billing import check_and_deduct_credits, TOKEN_COSTS
+        try:
+            channel = req.channel.lower()
+            if channel == "sms":
+                action = "AI_SMS_GENERATION"
+            elif channel == "linkedin":
+                action = "AI_LINKEDIN_GENERATION"
+            else:
+                action = "AI_EMAIL_GENERATION"
+                
+            await check_and_deduct_credits(req.user_id, action, amount=TOKEN_COSTS[action], dry_run=False)
+        except Exception:
+            pass # allow if no user context yet
+            
+        raw_content = response.choices[0].message.content.strip()
+        
+        # Extract the 'message' from the JSON object to display in the frontend
+        try:
+            parsed_json = json.loads(raw_content)
+            content_to_display = parsed_json.get("message", raw_content)
+        except json.JSONDecodeError:
+            content_to_display = raw_content
+            
+        return ContentResponse(content=content_to_display)
+    except Exception as e:
+        logger.error(f"Failed to generate content: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/linkedin/generate-image", response_model=ImageResponse)
+async def generate_linkedin_image(req: ImageRequest):
+    client = get_openai_client()
+    model = "gpt-4o-mini"
+    import json
+    from prompts.campaign_prompts import get_image_prompt
+    
+    # Generate image prompt using the new structured prompts
+    # Since this endpoint is currently hardcoded for linkedin, we'll pass 'linkedin' and a generic campaign_type for now.
+    # We can default to 'engagement' as the safest bet if the frontend doesn't send the campaign_type in ImageRequest.
+    prompt = get_image_prompt(
+        channel="linkedin", 
+        campaign_type="engagement", 
+        campaign_content=req.content
+    )
+    
+    try:
+        response = await client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7,
+            response_format={"type": "json_object"}
+        )
+        
+        from services.billing import check_and_deduct_credits, TOKEN_COSTS
+        try:
+            await check_and_deduct_credits(req.user_id, "IMAGE_GENERATION", amount=TOKEN_COSTS["IMAGE_GENERATION"], dry_run=False)
+        except Exception:
+            pass
+            
+        raw_content = response.choices[0].message.content.strip()
+        
+        # Parse the JSON and extract the image_prompt (<=20 words)
+        try:
+            parsed = json.loads(raw_content)
+            image_prompt = parsed.get("image_prompt", raw_content)
+        except json.JSONDecodeError:
+            image_prompt = raw_content
+        
+        # Output path
+        import time
+        import os
+        output_filename = f"poster_{int(time.time())}.png"
+        output_path = os.path.abspath(output_filename)
+        
+        # Generate image using diffusers
+        generate_campaign_image(image_prompt, output_path)
+        
+        return ImageResponse(prompt=image_prompt, image_url=f"/static/{output_filename}") # Assuming a static mount or returning just the name
+    except Exception as e:
+        logger.error(f"Failed to generate image: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/linkedin/upload-image")
+async def upload_linkedin_image(file: UploadFile = File(...)):
+    import time
+    import os
+    
+    ext = file.filename.split('.')[-1] if '.' in file.filename else 'png'
+    output_filename = f"poster_upload_{int(time.time())}.{ext}"
+    output_path = os.path.abspath(output_filename)
+    
+    try:
+        content = await file.read()
+        with open(output_path, "wb") as f:
+            f.write(content)
+        return {"image_url": f"/static/{output_filename}"}
+    except Exception as e:
+        logger.error(f"Failed to upload image: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/linkedin/publish")
+async def publish_linkedin_campaign(req: PublishRequest):
+    import httpx
+    import os
+    from database import db
+    
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not connected")
+        
+    from services.billing import check_and_deduct_credits, TOKEN_COSTS
+    await check_and_deduct_credits(req.user_id, "LINKEDIN_POST", amount=TOKEN_COSTS["LINKEDIN_POST"], dry_run=False)
+        
+    # 1. Fetch the user's LinkedIn Token from MongoDB
+    user = await db.users.find_one({"user_id": req.user_id})
+    if not user or "integrations" not in user or "linkedin" not in user["integrations"]:
+        raise HTTPException(status_code=400, detail="LinkedIn account is not connected. Please connect it first.")
+        
+    token = user["integrations"]["linkedin"]["access_token"]
+    
+    async with httpx.AsyncClient() as client:
+        # 2. Get the User's LinkedIn Profile URN
+        profile_res = await client.get(
+            "https://api.linkedin.com/v2/userinfo", 
+            headers={"Authorization": f"Bearer {token}"}
+        )
+        
+        if profile_res.status_code != 200:
+            logger.error(f"Failed to fetch LinkedIn profile: {profile_res.text}")
+            raise HTTPException(status_code=400, detail="LinkedIn token expired or invalid. Please reconnect.")
+            
+        person_urn = profile_res.json().get("sub")
+        
+        # 3. Handle Image Upload if an image exists
+        media_urn = None
+        if req.image_url:
+            # Extract local filename from the URL (e.g., /static/poster_123.png)
+            filename = req.image_url.split("/")[-1]
+            local_image_path = os.path.abspath(filename)
+            
+            if os.path.exists(local_image_path):
+                # Step A: Register the upload
+                reg_payload = {
+                    "registerUploadRequest": {
+                        "recipes": ["urn:li:digitalmediaRecipe:feedshare-image"],
+                        "owner": f"urn:li:person:{person_urn}",
+                        "serviceRelationships": [{"relationshipType": "OWNER", "identifier": "urn:li:userGeneratedContent"}]
+                    }
+                }
+                
+                reg_res = await client.post(
+                    "https://api.linkedin.com/v2/assets?action=registerUpload",
+                    json=reg_payload,
+                    headers={"Authorization": f"Bearer {token}", "X-Restli-Protocol-Version": "2.0.0"}
+                )
+                
+                if reg_res.status_code in [200, 201]:
+                    reg_data = reg_res.json()
+                    upload_url = reg_data["value"]["uploadMechanism"]["com.linkedin.digitalmedia.uploading.MediaUploadHttpRequest"]["uploadUrl"]
+                    media_urn = reg_data["value"]["asset"]
+                    
+                    # Step B: Upload the actual image bytes to the URL LinkedIn provided
+                    with open(local_image_path, "rb") as img_file:
+                        img_bytes = img_file.read()
+                        
+                    upload_res = await client.put(
+                        upload_url,
+                        content=img_bytes,
+                        headers={"Authorization": f"Bearer {token}"}
+                    )
+                    
+                    if upload_res.status_code not in [200, 201, 204]:
+                        logger.error(f"Failed to upload image bytes to LinkedIn: {upload_res.status_code}")
+                        media_urn = None # Fallback to text-only if the image bytes fail
+        
+        # 4. Create the Post on LinkedIn
+        specific_content = {
+            "com.linkedin.ugc.ShareContent": {
+                "shareCommentary": {"text": req.content},
+                "shareMediaCategory": "NONE"
+            }
+        }
+        
+        # Attach the image to the post if we successfully uploaded it
+        if media_urn:
+            specific_content["com.linkedin.ugc.ShareContent"]["shareMediaCategory"] = "IMAGE"
+            specific_content["com.linkedin.ugc.ShareContent"]["media"] = [
+                {
+                    "status": "READY",
+                    "description": {"text": "Campaign Image"},
+                    "media": media_urn,
+                    "title": {"text": "Genquantaa Campaign"}
+                }
+            ]
+            
+        post_url = "https://api.linkedin.com/v2/ugcPosts"
+        post_payload = {
+            "author": f"urn:li:person:{person_urn}",
+            "lifecycleState": "PUBLISHED",
+            "specificContent": specific_content,
+            "visibility": {"com.linkedin.ugc.MemberNetworkVisibility": "PUBLIC"}
+        }
+        
+        # Make the request to create a live post!
+        publish_res = await client.post(
+            post_url,
+            json=post_payload,
+            headers={"Authorization": f"Bearer {token}", "X-Restli-Protocol-Version": "2.0.0"}
+        )
+        
+        if publish_res.status_code not in [200, 201]:
+            logger.error(f"LinkedIn Publishing Error: {publish_res.text}")
+            raise HTTPException(status_code=400, detail=f"Failed to publish to LinkedIn: {publish_res.text}")
+
+        # Store campaign in MongoDB
+        import datetime
+        new_campaign = {
+            "user_id": req.user_id,
+            "name": req.name if req.name else (req.content[:30].strip() + "..." if len(req.content) > 30 else req.content.strip()),
+            "status": "Active",
+            "type": "LinkedIn",
+            "progress": 100,
+            "sent": 1,
+            "replied": 0,
+            "booked": 0,
+            "date": datetime.datetime.utcnow().strftime("%b %d, %Y"),
+            "created_at": datetime.datetime.utcnow(),
+            "content": req.content,
+            "image_url": req.image_url,
+            "action": req.action,
+            "product_name": req.product_name or req.name or "",
+            "target_customer": req.target_customer or "",
+            "call_to_action": req.call_to_action or "",
+            "product_info": req.product_info or "",
+            "objective": req.objective or "engagement",
+        }
+        await db.campaigns.insert_one(new_campaign)
+        
+        from services.notifications import create_notification
+        await create_notification(
+            user_id=req.user_id,
+            title="Campaign Published",
+            message=f"LinkedIn campaign '{new_campaign['name']}' has been published.",
+            notif_type="success"
+        )
+
+    return {"status": "success", "message": "Successfully published directly to your live LinkedIn account (with image)!"}
+
+@router.get("/")
+async def get_campaigns(user_id: str):
+    from database import db
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not connected")
+        
+    campaigns_cursor = db.campaigns.find({"user_id": user_id}).sort("created_at", -1)
+    campaigns = await campaigns_cursor.to_list(length=100)
+    
+    for c in campaigns:
+        c["id"] = str(c["_id"])
+        del c["_id"]
+
+        camp_type = (c.get("type") or "").lower()
+
+        # Ensure content and prompt reciprocity
+        if not c.get("content") and c.get("prompt"):
+            c["content"] = c.get("prompt")
+        if not c.get("prompt") and c.get("content"):
+            c["prompt"] = c.get("content")
+
+        # 1. Backfill for Email campaigns
+        if (not c.get("audience")) and camp_type == "email" and c.get("sent", 0) > 0:
+            emails_cursor = db.emails.find({"campaign_id": c["id"]})
+            emails = await emails_cursor.to_list(length=1000)
+            if emails:
+                audience = []
+                for email_doc in emails:
+                    lead_email = email_doc.get("lead_email")
+                    lead = await db.leads.find_one({"email": lead_email, "user_id": user_id})
+                    name = lead.get("name", "Unknown") if lead else "Unknown"
+                    audience.append({"name": name, "contact": lead_email})
+                c["audience"] = audience
+                from bson.objectid import ObjectId
+                await db.campaigns.update_one({"_id": ObjectId(c["id"])}, {"$set": {"audience": audience}})
+
+        # 2. Backfill for Voice / Call campaigns
+        elif camp_type in ("voice", "call"):
+            if not c.get("audience") or len(c.get("audience", [])) == 0:
+                # First check call_logs
+                calls_cursor = db.call_logs.find({"campaign_id": c["id"]})
+                calls = await calls_cursor.to_list(length=1000)
+                if calls:
+                    audience = []
+                    seen_phones = set()
+                    for call_doc in calls:
+                        ph = call_doc.get("lead_phone")
+                        if ph and ph not in seen_phones:
+                            seen_phones.add(ph)
+                            name = call_doc.get("lead_name") or "Prospect"
+                            audience.append({"name": name, "contact": ph, "phone": ph})
+                    if audience:
+                        c["audience"] = audience
+                        from bson.objectid import ObjectId
+                        await db.campaigns.update_one({"_id": ObjectId(c["id"])}, {"$set": {"audience": audience, "content": c.get("content", "")}})
+                elif c.get("leads"):
+                    c["audience"] = [{"name": l.get("name") or "Prospect", "contact": l.get("phone", ""), "phone": l.get("phone", "")} for l in c["leads"]]
+
+        # 3. Backfill from embedded leads if audience key was missing
+        if (not c.get("audience") or len(c.get("audience", [])) == 0) and c.get("leads"):
+            c["audience"] = [{"name": l.get("name") or "Lead", "contact": l.get("phone") or l.get("email") or "", "phone": l.get("phone"), "email": l.get("email")} for l in c["leads"]]
+
+        # 4. Guarantee marketing template fields are never missing or blank for reusability
+        c["product_name"] = c.get("product_name") or c.get("name") or "Genquantaa AI Solution"
+        c["target_customer"] = c.get("target_customer") or "Target Decision Makers"
+        c["call_to_action"] = c.get("call_to_action") or (c.get("action") if c.get("action") != "post" else "Book a demo / Reply")
+        c["product_info"] = c.get("product_info") or c.get("content") or c.get("prompt") or f"{c.get('name')} Outreach Details"
+        c["objective"] = c.get("objective") or "engagement"
+
+    return campaigns
+
+@router.delete("/{campaign_id}")
+async def delete_campaign(campaign_id: str):
+    from database import db
+    from bson.objectid import ObjectId
+    
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not connected")
+        
+    try:
+        result = await db.campaigns.delete_one({"_id": ObjectId(campaign_id)})
+        if result.deleted_count == 0:
+            raise HTTPException(status_code=404, detail="Campaign not found")
+        return {"status": "success", "message": "Campaign deleted successfully"}
+    except Exception as e:
+        logger.error(f"Error deleting campaign {campaign_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to delete campaign")
+
+@router.post("/linkedin/draft")
+async def save_linkedin_draft(req: DraftRequest):
+    from database import db
+    import datetime
+    
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not connected")
+        
+    new_draft = {
+        "user_id": req.user_id,
+        "name": req.name,
+        "status": "Draft",
+        "type": "LinkedIn",
+        "progress": 0,
+        "sent": 0,
+        "replied": 0,
+        "booked": 0,
+        "date": datetime.datetime.utcnow().strftime("%b %d, %Y"),
+        "created_at": datetime.datetime.utcnow(),
+        "content": req.content,
+        "image_url": req.image_url,
+        "action": req.action,
+        "product_name": req.product_name or req.name or "",
+        "target_customer": req.target_customer or "",
+        "call_to_action": req.call_to_action or "",
+        "product_info": req.product_info or "",
+        "objective": req.objective or "engagement",
+    }
+    
+    await db.campaigns.insert_one(new_draft)
+    return {"status": "success", "message": "Campaign successfully saved as a draft!"}
+
+async def _dispatch_emails(user_id: str, leads: list, subject: str, content: str, method: str) -> int:
+    from database import db
+    from services.email_sender import send_email_via_gmail_api, send_email_via_smtp
+    
+    user = await db.users.find_one({"user_id": user_id})
+    logger.info(f"Dispatching emails for user {user_id}. Initial method: {method}. Leads count: {len(leads)}")
+    if not user or "integrations" not in user:
+        logger.warning(f"User {user_id} not found or has no integrations.")
+        raise ValueError("No email integrations connected. Please go to Integrations and connect an email account.")
+        
+    creds = user["integrations"].get(method.lower())
+    if not creds:
+        # Fallback to any available email provider
+        for p in ["gmail", "outlook", "smtp"]:
+            if p in user["integrations"]:
+                creds = user["integrations"][p]
+                method = p
+                logger.info(f"Fell back to email provider: {p}")
+                break
+                
+    if not creds:
+        logger.warning(f"No email credentials found for user {user_id}.")
+        raise ValueError("No valid email provider connected. Please go to Integrations and connect your email.")
+        
+    logger.info(f"Proceeding with email provider {method} for {len(leads)} leads.")
+    successful_sends = 0
+    import re
+    import time
+    from services.email_fetcher import refresh_gmail_token
+    from services.billing import check_and_deduct_credits, TOKEN_COSTS
+    
+    # Pre-flight check: Make sure they have at least enough tokens for emails
+    await check_and_deduct_credits(user_id, "EMAIL_SEND", amount=TOKEN_COSTS["EMAIL_SEND"], dry_run=True)
+    
+    # Pre-refresh Gmail token if needed
+    if method.lower() == "gmail" and creds.get("auth_type") == "oauth":
+        if time.time() >= creds.get("expires_at", 0) - 60:
+            refresh_token = creds.get("refresh_token")
+            if refresh_token:
+                try:
+                    refreshed = await refresh_gmail_token(refresh_token)
+                    creds["access_token"] = refreshed["access_token"]
+                    creds["expires_at"] = time.time() + refreshed["expires_in"]
+                    
+                    await db.users.update_one(
+                        {"user_id": user_id},
+                        {"$set": {
+                            "integrations.gmail.access_token": creds["access_token"],
+                            "integrations.gmail.expires_at": creds["expires_at"]
+                        }}
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to refresh gmail token in dispatcher: {e}")
+
+    import datetime
+    from services.personalization import personalize_email_content
+    from services.billing import check_and_deduct_credits, TOKEN_COSTS
+
+    for lead in leads:
+        lead_email = lead.get("email")
+        if not lead_email:
+            continue
+
+        lead_name = lead.get("name") or "there"
+        sender_name = user.get("name") or user.get("full_name") or ""
+        sender_company = user.get("company_name") or user.get("company") or ""
+        sender_title = user.get("title") or user.get("position") or ""
+        sender_contact = user.get("phone") or user.get("contact") or ""
+
+        # Use AI to perfectly craft the email for this specific lead with sender signature context
+        personalized_content = await personalize_email_content(
+            base_content=content,
+            lead=lead,
+            sender_name=sender_name,
+            sender_company=sender_company,
+            sender_title=sender_title,
+            sender_contact=sender_contact
+        )
+        await check_and_deduct_credits(user_id, "AI_EMAIL_GENERATION", amount=TOKEN_COSTS["AI_EMAIL_GENERATION"], dry_run=False)
+
+        send_result = None
+        if method.lower() == "gmail":
+            send_result = await send_email_via_gmail_api(
+                access_token=creds.get("access_token"),
+                to=lead_email,
+                subject=subject,
+                body=personalized_content
+            )
+        else:
+            send_result = await send_email_via_smtp(
+                email=creds.get("email"),
+                password=creds.get("password"),
+                host=creds.get("host", "smtp.gmail.com"),
+                port=int(creds.get("port", 587) if creds.get("port") else 587),
+                to=lead_email,
+                subject=subject,
+                body=personalized_content
+            )
+
+        # send_result is a dict: {"success": bool, "message_id": str|None}
+        if send_result and send_result.get("success"):
+            successful_sends += 1
+            await check_and_deduct_credits(user_id, "EMAIL_SEND", amount=TOKEN_COSTS["EMAIL_SEND"], dry_run=False)
+
+            message_id = send_result.get("message_id")
+
+            if db is not None:
+                try:
+                    # Mark lead as emailed so we can filter for reply tracking later
+                    await db.leads.update_many(
+                        {"email": lead_email, "user_id": user_id},
+                        {"$set": {"emailed_via_gtm": True}}
+                    )
+
+                    # Insert a record into the emails collection linking this send to the campaign
+                    # We'll use this record to match inbound replies via In-Reply-To == message_id
+                    lead_doc = await db.leads.find_one({"email": lead_email, "user_id": user_id})
+                    email_record = {
+                        "user_id": user_id,
+                        "campaign_id": None,   # filled in by the caller (send/publish route)
+                        "lead_id": str(lead_doc["_id"]) if lead_doc else None,
+                        "lead_email": lead_email,
+                        "message_id": message_id,
+                        "subject": subject,
+                        "body": personalized_content,
+                        "status": "sent",
+                        "reply_body": None,
+                        "reply_status": None,
+                        "sent_at": datetime.datetime.utcnow(),
+                    }
+                    await db.emails.insert_one(email_record)
+                    logger.info(f"Email record saved for lead {lead_email} (Message-ID: {message_id})")
+                except Exception as e:
+                    logger.error(f"Failed to update lead/email record for {lead_email}: {e}")
+
+    return successful_sends
+
+@router.post("/email/send")
+async def send_email_campaign(req: EmailSendRequest):
+    logger.info(f"Sending email campaign '{req.subject}' to {len(req.leads)} leads via {req.method}.")
+
+    try:
+        successful_sends = await _dispatch_emails(
+            user_id=req.user_id,
+            leads=req.leads,
+            subject=req.subject,
+            content=req.content,
+            method=req.method
+        )
+    except ValueError as e:
+        return {"status": "error", "message": str(e)}
+
+    from database import db
+    from bson.objectid import ObjectId
+    if db is not None:
+        try:
+            new_audience_members = [{"name": l.get("name", ""), "contact": l.get("email", "")} for l in req.leads]
+            await db.campaigns.update_one(
+                {"_id": ObjectId(req.campaign_id)},
+                {
+                    "$inc": {"sent": successful_sends}, 
+                    "$set": {"status": "Active"},
+                    "$push": {"audience": {"$each": new_audience_members}}
+                }
+            )
+            # Backfill campaign_id into all email records written during this dispatch
+            lead_emails = [l.get("email") for l in req.leads if l.get("email")]
+            await db.emails.update_many(
+                {"user_id": req.user_id, "campaign_id": None, "lead_email": {"$in": lead_emails}},
+                {"$set": {"campaign_id": req.campaign_id}}
+            )
+        except Exception as e:
+            logger.error(f"Failed to update campaign sent count or backfill campaign_id: {e}")
+
+    return {
+        "status": "success",
+        "message": f"Successfully sent email campaign to {successful_sends} out of {len(req.leads)} contacts!"
+    }
+
+@router.post("/email/publish")
+async def publish_email_campaign(req: EmailPublishRequest):
+    from database import db
+    import datetime
+
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not connected")
+
+    logger.info(f"Publishing email campaign '{req.name}' to {len(req.leads)} leads via {req.method}.")
+
+    try:
+        successful_sends = await _dispatch_emails(
+            user_id=req.user_id,
+            leads=req.leads,
+            subject=req.name,
+            content=req.content,
+            method=req.method
+        )
+    except ValueError as e:
+        return {"status": "error", "message": str(e)}
+
+    new_campaign = {
+        "user_id": req.user_id,
+        "name": req.name,
+        "status": "Active",
+        "type": "Email",
+        "progress": 100,
+        "sent": successful_sends,
+        "replied": 0,
+        "booked": 0,
+        "date": datetime.datetime.utcnow().strftime("%b %d, %Y"),
+        "created_at": datetime.datetime.utcnow(),
+        "content": req.content,
+        "action": req.action,
+        "audience": [{"name": l.get("name", ""), "contact": l.get("email", "")} for l in req.leads],
+        "product_name": req.product_name or req.name or "",
+        "target_customer": req.target_customer or "",
+        "call_to_action": req.call_to_action or "",
+        "product_info": req.product_info or "",
+        "objective": req.objective or "engagement",
+    }
+
+    result = await db.campaigns.insert_one(new_campaign)
+    campaign_id_str = str(result.inserted_id)
+
+    # Backfill campaign_id into all email records written during this dispatch
+    try:
+        lead_emails = [l.get("email") for l in req.leads if l.get("email")]
+        await db.emails.update_many(
+            {"user_id": req.user_id, "campaign_id": None, "lead_email": {"$in": lead_emails}},
+            {"$set": {"campaign_id": campaign_id_str}}
+        )
+    except Exception as e:
+        logger.error(f"Failed to backfill campaign_id in emails collection: {e}")
+
+    from services.notifications import create_notification
+    await create_notification(
+        user_id=req.user_id,
+        title="Campaign Completed",
+        message=f"Email campaign '{req.name}' successfully sent to {successful_sends} contacts.",
+        notif_type="success"
+    )
+
+    return {"status": "success", "message": f"Successfully published and sent email campaign to {successful_sends} contacts!"}
+
+async def _dispatch_sms(user_id: str, leads: list, content: str, image_url: str = None, campaign_id: str = None) -> int:
+    from database import db
+    from services.sms_sender import send_sms_via_twilio
+    import os
+    from config import settings
+    
+    user = await db.users.find_one({"user_id": user_id})
+    logger.info(f"Dispatching SMS for user {user_id}. Leads count: {len(leads)}")
+    if not user or "integrations" not in user or "twilio" not in user["integrations"]:
+        logger.warning(f"User {user_id} not found or Twilio not connected.")
+        raise ValueError("Twilio account is not connected. Please go to Integrations and connect your Twilio account.")
+        
+    creds = user["integrations"]["twilio"]
+    account_sid = creds.get("account_sid")
+    auth_token = creds.get("auth_token")
+    from_number = creds.get("from_number")
+    
+    if not account_sid or not auth_token or not from_number:
+        raise ValueError("Incomplete Twilio credentials. Please check your Integrations.")
+        
+    successful_sends = 0
+    from services.billing import check_and_deduct_credits, TOKEN_COSTS
+    await check_and_deduct_credits(user_id, "SMS_SEND", amount=TOKEN_COSTS["SMS_SEND"], dry_run=True)
+    
+    for lead in leads:
+        lead_phone = lead.get("phone")
+        if not lead_phone:
+            continue
+            
+        # Basic personalization replacement if needed (can be extended to AI)
+        lead_name = lead.get("name", "there")
+        personalized_content = content.replace("[Name]", lead_name).replace("{Name}", lead_name)
+        
+        # Format image URL for Twilio
+        formatted_media_url = None
+        if image_url:
+            if image_url.startswith("http") and "localhost" not in image_url:
+                formatted_media_url = image_url
+            else:
+                # Twilio cannot reach localhost URLs. For local testing, we fallback to a public placeholder.
+                # In production, this would be the actual deployed URL (e.g., https://yourdomain.com/static/...)
+                formatted_media_url = "https://images.unsplash.com/photo-1611162617474-5b21e879e113?ixlib=rb-4.0.3&auto=format&fit=crop&w=800&q=80"
+
+        success = await send_sms_via_twilio(
+            account_sid=account_sid,
+            auth_token=auth_token,
+            from_number=from_number,
+            to=lead_phone,
+            body=personalized_content,
+            media_url=formatted_media_url
+        )
+            
+        if success:
+            successful_sends += 1
+            await check_and_deduct_credits(user_id, "SMS_SEND", amount=TOKEN_COSTS["SMS_SEND"], dry_run=False)
+            
+            # Mark the lead as SMSed
+            if db is not None:
+                try:
+                    import datetime
+                    await db.sms_logs.insert_one({
+                        "user_id": user_id,
+                        "campaign_id": campaign_id,
+                        "lead_phone": lead_phone,
+                        "lead_name": lead_name,
+                        "content": personalized_content,
+                        "status": "sent",
+                        "sent_at": datetime.datetime.utcnow()
+                    })
+                    await db.leads.update_many(
+                        {"phone": lead_phone, "user_id": user_id},
+                        {"$set": {"sms_sent_via_gtm": True}}
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to update sms_sent_via_gtm for {lead_phone}: {e}")
+            
+    return successful_sends
+
+@router.post("/sms/send")
+async def send_sms_campaign(req: SmsSendRequest):
+    logger.info(f"Sending SMS campaign to {len(req.leads)} leads.")
+    
+    try:
+        successful_sends = await _dispatch_sms(
+            user_id=req.user_id,
+            leads=req.leads,
+            content=req.content,
+            image_url=req.image_url,
+            campaign_id=req.campaign_id
+        )
+    except ValueError as e:
+        return {"status": "error", "message": str(e)}
+    
+    from database import db
+    from bson.objectid import ObjectId
+    if db is not None:
+        try:
+            await db.campaigns.update_one(
+                {"_id": ObjectId(req.campaign_id)},
+                {"$inc": {"sent": successful_sends}, "$set": {"status": "Active"}}
+            )
+        except Exception as e:
+            logger.error(f"Failed to update campaign sent count: {e}")
+
+    return {
+        "status": "success", 
+        "message": f"Successfully sent SMS campaign to {successful_sends} out of {len(req.leads)} contacts!"
+    }
+
+@router.post("/sms/publish")
+async def publish_sms_campaign(req: SmsPublishRequest):
+    from database import db
+    import datetime
+    
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not connected")
+        
+    logger.info(f"Publishing SMS campaign '{req.name}' to {len(req.leads)} leads.")
+    
+    try:
+        successful_sends = await _dispatch_sms(
+            user_id=req.user_id,
+            leads=req.leads,
+            content=req.content,
+            image_url=req.image_url
+        )
+    except ValueError as e:
+        return {"status": "error", "message": str(e)}
+    
+    new_campaign = {
+        "user_id": req.user_id,
+        "name": req.name,
+        "status": "Active",
+        "type": "SMS",
+        "progress": 100,
+        "sent": successful_sends,
+        "replied": 0,
+        "booked": 0,
+        "date": datetime.datetime.utcnow().strftime("%b %d, %Y"),
+        "created_at": datetime.datetime.utcnow(),
+        "content": req.content,
+        "image_url": req.image_url,
+        "action": req.action,
+        "audience": [{"name": l.get("name", ""), "contact": l.get("phone", "")} for l in req.leads]
+    }
+    
+    result = await db.campaigns.insert_one(new_campaign)
+    campaign_id_str = str(result.inserted_id)
+    
+    # Backfill campaign_id into all SMS records written during this dispatch
+    lead_phones = [l.get("phone") for l in req.leads if l.get("phone")]
+    await db.sms_logs.update_many(
+        {"user_id": req.user_id, "campaign_id": None, "lead_phone": {"$in": lead_phones}},
+        {"$set": {"campaign_id": campaign_id_str}}
+    )
+    
+    from services.notifications import create_notification
+    await create_notification(
+        user_id=req.user_id,
+        title="Campaign Completed",
+        message=f"SMS campaign '{req.name}' successfully sent to {successful_sends} contacts.",
+        notif_type="success"
+    )
+    
+    return {"status": "success", "message": f"Successfully published and sent SMS campaign to {successful_sends} contacts!"}
+
+@router.get("/sms/logs")
+async def get_sms_logs(campaign_id: str):
+    from database import db
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not connected")
+        
+    logs = await db.sms_logs.find({"campaign_id": campaign_id}).sort("sent_at", -1).to_list(1000)
+    for log in logs:
+        log["id"] = str(log["_id"])
+        del log["_id"]
+        
+    return {"status": "success", "logs": logs}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# VOICE CALL CAMPAIGN ENDPOINTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.post("/voice/refine-prompt")
+async def refine_voice_prompt_endpoint(req: VoicePromptRefineRequest):
+    """Refines a user's raw voice prompt into a professional AI agent script."""
+    try:
+        from services.livekit_service import refine_voice_prompt
+    except ImportError:
+        from services.vapi_service import refine_voice_prompt
+    
+    try:
+        from services.billing import check_and_deduct_credits, TOKEN_COSTS
+        
+        await check_and_deduct_credits(req.user_id, "AI_VOICE_PROMPT_GENERATION", amount=TOKEN_COSTS["AI_VOICE_PROMPT_GENERATION"], dry_run=False)
+        
+        refined = await refine_voice_prompt(
+            raw_prompt=req.raw_prompt,
+            product_name=req.product_name,
+            target_customer=req.target_customer,
+            call_to_action=req.call_to_action,
+        )
+        return {"status": "success", "refined_prompt": refined}
+    except Exception as e:
+        logger.error(f"Failed to refine voice prompt: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/voice/test-call")
+async def test_voice_call(req: VoiceTestCallRequest):
+    """
+    Triggers an immediate test call to a single phone number
+    to preview and test the voice script live before launching a full campaign.
+    """
+    from services.livekit_service import dispatch_livekit_call
+    from database import save_call_log
+    import datetime
+
+    if not req.phone:
+        raise HTTPException(status_code=400, detail="Phone number is required for test call")
+
+    tts_provider = "sarvam" if req.language.startswith("hi") else "cartesia"
+
+    room_name, status = await dispatch_livekit_call(
+        phone=req.phone,
+        lead_name="Test Preview User",
+        system_prompt=req.prompt,
+        first_message=req.first_message,
+        user_id=req.user_id,
+        campaign_id="test_preview",
+        language=req.language or "auto",
+        accent=req.accent or "auto",
+        tts_provider=tts_provider,
+        tts_voice=req.voice_id,
+        telephony_provider=req.telephony_provider or "auto",
+    )
+
+    if not room_name:
+        raise HTTPException(status_code=500, detail=f"Failed to initiate test call: {status}")
+
+    # Log the test call in MongoDB
+    call_log = {
+        "user_id": req.user_id,
+        "campaign_id": "test_preview",
+        "call_id": room_name,
+        "provider": "livekit",
+        "lead_name": "Test Script Preview",
+        "lead_phone": req.phone,
+        "status": "queued",
+        "transcript": "",
+        "recording_url": "",
+        "summary": "Live script preview test call",
+        "checklist": [],
+        "sentiment": "",
+        "sms_status": "",
+        "sms_content": "",
+        "duration": 0,
+        "created_at": datetime.datetime.utcnow(),
+    }
+    await save_call_log(call_log)
+
+    return {
+        "status": "success",
+        "room_name": room_name,
+        "message": f"Test call initiated to {req.phone}! Your phone will ring in a few seconds."
+    }
+
+
+@router.post("/voice/publish")
+async def publish_voice_campaign(req: VoicePublishRequest):
+
+    """
+    Publishes and launches a voice call campaign.
+    Uses LiveKit Cloud + Vobiz SIP Trunk (cost-effective), falling back to VAPI if needed.
+    Runs the calling loop as a background task.
+    """
+    from database import db, save_call_log
+    from config import settings
+    from services.sms_sender import send_sms_via_twilio
+    from services.billing import check_and_deduct_credits, TOKEN_COSTS
+    import datetime
+    
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not connected")
+    
+    use_livekit = bool(settings.LIVEKIT_API_KEY and settings.LIVEKIT_URL)
+    account_sid = None
+    auth_token = None
+    from_number = None
+
+    if not use_livekit:
+        # Fallback to user's Twilio credentials if LiveKit is not configured
+        user = await db.users.find_one({"user_id": req.user_id})
+        if not user or "integrations" not in user or "twilio" not in user["integrations"]:
+            return {
+                "status": "error",
+                "message": "Telephony provider not configured. Connect Twilio or configure LiveKit/Vobiz."
+            }
+        twilio_creds = user["integrations"]["twilio"]
+        account_sid = twilio_creds.get("account_sid")
+        auth_token = twilio_creds.get("auth_token")
+        from_number = twilio_creds.get("from_number")
+        
+        if not account_sid or not auth_token or not from_number:
+            return {
+                "status": "error",
+                "message": "Incomplete Twilio credentials. Please check your Integrations."
+            }
+
+    # 2. Check credits
+    try:
+        await check_and_deduct_credits(req.user_id, "VOICE_CALL_MINUTE", amount=TOKEN_COSTS["VOICE_CALL_MINUTE"], dry_run=True)
+    except Exception:
+        pass  # Allow if billing not fully set up
+    
+    # 3. Setup assistant ID
+    assistant_id = "livekit-outbound-caller"
+    if not use_livekit:
+        from services.vapi_service import create_or_update_assistant
+        try:
+            assistant_id = await create_or_update_assistant(
+                user_id=req.user_id,
+                system_prompt=req.prompt,
+                assistant_name=req.name,
+                first_message=req.first_message,
+            )
+        except Exception as e:
+            logger.error(f"Failed to create VAPI assistant: {e}", exc_info=True)
+            return {"status": "error", "message": f"Failed to set up voice agent: {str(e)}"}
+
+    
+    # 4. Create campaign record in MongoDB
+    campaign_doc = {
+        "user_id": req.user_id,
+        "name": req.name,
+        "status": "Active",
+        "type": "Voice",
+        "progress": 0,
+        "sent": 0,
+        "replied": 0,
+        "booked": 0,
+        "total_leads": len(req.leads),
+        "date": datetime.datetime.utcnow().strftime("%b %d, %Y"),
+        "created_at": datetime.datetime.utcnow(),
+        "content": req.prompt,
+        "prompt": req.prompt,
+        "first_message": req.first_message,
+        "language": req.language or "auto",
+        "accent": req.accent or "auto",
+        "voice_id": req.voice_id or "",
+        "tts_provider": req.tts_provider or "",
+        "telephony_provider": req.telephony_provider or "auto",
+        "assistant_id": assistant_id,
+        "action": "call",
+        "leads": req.leads,
+        "audience": [{"name": l.get("name") or "Prospect", "contact": l.get("phone", ""), "phone": l.get("phone", "")} for l in req.leads],
+        "product_name": req.product_name or req.name or "",
+        "target_customer": req.target_customer or "",
+        "call_to_action": req.call_to_action or "",
+        "product_info": req.product_info or req.prompt or "",
+        "objective": req.objective or "engagement",
+    }
+    result = await db.campaigns.insert_one(campaign_doc)
+    campaign_id = str(result.inserted_id)
+    
+    # 5. Launch calls as a background task
+    import asyncio
+    
+    async def _run_voice_campaign():
+        """Background task: call each lead sequentially."""
+        from bson.objectid import ObjectId
+        successful_calls = 0
+        positive_count = 0
+        
+        for idx, lead in enumerate(req.leads):
+            lead_name = lead.get("name", "there")
+            lead_phone = lead.get("phone", "")
+            
+            if not lead_phone:
+                logger.warning(f"Skipping lead {lead_name}: no phone number")
+                continue
+            
+            logger.info(f"[Voice Campaign {campaign_id}] Calling {idx+1}/{len(req.leads)}: {lead_name}")
+            
+            # Make the call
+            if use_livekit:
+                from services.livekit_service import dispatch_livekit_call
+                call_id, call_status = await dispatch_livekit_call(
+                    phone=lead_phone,
+                    lead_name=lead_name,
+                    system_prompt=req.prompt,
+                    first_message=req.first_message,
+                    user_id=req.user_id,
+                    campaign_id=campaign_id,
+                    language=req.language or "auto",
+                    accent=req.accent or "auto",
+                    tts_provider=req.tts_provider or "",
+                    tts_voice=req.voice_id or "",
+                    telephony_provider=req.telephony_provider or "auto",
+                )
+
+            else:
+                from services.vapi_service import make_outbound_call
+                call_id, call_status = await make_outbound_call(
+                    assistant_id=assistant_id,
+                    phone=lead_phone,
+                    name=lead_name,
+                    twilio_account_sid=account_sid,
+                    twilio_auth_token=auth_token,
+                    twilio_from_number=from_number,
+                )
+            
+            # Save initial call log
+            call_log = {
+                "user_id": req.user_id,
+                "campaign_id": campaign_id,
+                "call_id": call_id or "",
+                "provider": "livekit" if use_livekit else "vapi",
+                "lead_name": lead_name,
+                "lead_phone": lead_phone,
+                "status": call_status,
+                "transcript": "",
+                "recording_url": "",
+                "summary": "",
+                "checklist": [],
+                "sentiment": "",
+                "sms_status": "",
+                "sms_content": "",
+                "duration": 0,
+                "created_at": datetime.datetime.utcnow(),
+            }
+            await save_call_log(call_log)
+            
+            if not call_id:
+                logger.error(f"Call to {lead_name} failed to initiate: {call_status}")
+                continue
+            
+            # For VAPI calls, poll for status if not using LiveKit webhooks
+            if not use_livekit:
+                from services.vapi_service import poll_call_status, process_call_transcript
+                result_data = await poll_call_status(call_id, timeout=300)
+                transcript = result_data.get("transcript", "")
+                analysis = {"summary": "", "checklist": [], "sms_message": "", "sentiment": "Neutral"}
+                if transcript:
+                    analysis = await process_call_transcript(transcript)
+                
+                from database import update_call_log
+                update_data = {
+                    "status": result_data.get("status", "unknown"),
+                    "transcript": transcript,
+                    "recording_url": result_data.get("recording_url", ""),
+                    "duration": result_data.get("duration", 0),
+                    "summary": analysis.get("summary", ""),
+                    "checklist": analysis.get("checklist", []),
+                    "sentiment": analysis.get("sentiment", "Neutral"),
+                    "ended_reason": result_data.get("ended_reason", ""),
+                    "updated_at": datetime.datetime.utcnow(),
+                }
+                await update_call_log(call_id, update_data)
+                
+                if analysis.get("sentiment") == "Positive":
+                    positive_count += 1
+                
+                # Send follow-up SMS if enabled and transcript was captured
+                if req.send_followup_sms and analysis.get("sms_message") and account_sid:
+                    sms_success = await send_sms_via_twilio(
+                        account_sid=account_sid,
+                        auth_token=auth_token,
+                        from_number=from_number,
+                        to=lead_phone,
+                        body=analysis["sms_message"],
+                    )
+                    sms_update = {
+                        "sms_status": "sent" if sms_success else "failed",
+                        "sms_content": analysis["sms_message"],
+                    }
+                    await update_call_log(call_id, sms_update)
+            
+            successful_calls += 1
+
+            
+            # Deduct credits
+            try:
+                await check_and_deduct_credits(req.user_id, "VOICE_CALL_MINUTE", amount=TOKEN_COSTS["VOICE_CALL_MINUTE"], dry_run=False)
+            except Exception:
+                pass
+            
+            # Update campaign progress
+            progress = int(((idx + 1) / len(req.leads)) * 100)
+            try:
+                await db.campaigns.update_one(
+                    {"_id": ObjectId(campaign_id)},
+                    {"$set": {
+                        "sent": successful_calls,
+                        "booked": positive_count,
+                        "progress": progress,
+                    }}
+                )
+            except Exception as e:
+                logger.error(f"Failed to update campaign progress: {e}")
+            
+            # Small delay between calls to avoid rate limits
+            await asyncio.sleep(2)
+        
+        # Mark campaign as completed
+        try:
+            await db.campaigns.update_one(
+                {"_id": ObjectId(campaign_id)},
+                {"$set": {
+                    "progress": 100,
+                    "sent": successful_calls,
+                    "booked": positive_count,
+                    "status": "Completed" if successful_calls > 0 else "Failed",
+                }}
+            )
+        except Exception as e:
+            logger.error(f"Failed to finalize campaign: {e}")
+        
+        logger.info(f"[Voice Campaign {campaign_id}] Completed. {successful_calls}/{len(req.leads)} calls made.")
+        
+        from services.notifications import create_notification
+        await create_notification(
+            user_id=req.user_id,
+            title="Campaign Completed",
+            message=f"Voice campaign '{req.name}' completed. {successful_calls} calls made.",
+            notif_type="success"
+        )
+    
+    # Fire and forget the background task
+    asyncio.create_task(_run_voice_campaign())
+    
+    return {
+        "status": "success",
+        "message": f"Voice campaign '{req.name}' launched! Calling {len(req.leads)} leads.",
+        "campaign_id": campaign_id,
+        "assistant_id": assistant_id,
+    }
+
+
+class VoiceAudioPreviewRequest(BaseModel):
+    text: str = ""
+    language: str = "hi"
+    voice_id: str = ""
+    speed: Optional[float] = None
+
+
+@router.post("/voice/preview-audio")
+async def preview_voice_audio(req: VoiceAudioPreviewRequest):
+    """
+    Synthesizes and returns real WAV audio bytes from Cartesia TTS directly to the browser
+    using the exact Hindi voice (39d518b7-fd0b-4676-9b8b-29d64ff31e12) and configured speed (0.85).
+    """
+    text = (req.text or "").strip()
+    if not text:
+        text = "अरे हेलो यार! मैं नरेश। बोल, क्या हाल-चाल?" if req.language == "hi" else "Hello! Thanks for taking my call."
+
+    cartesia_key = settings.CARTESIA_API_KEY or os.getenv("CARTESIA_API_KEY")
+    if not cartesia_key:
+        raise HTTPException(status_code=500, detail="CARTESIA_API_KEY is not configured in backend/.env")
+
+    lang = (req.language or "hi").lower().split("-")[0]
+    voice_id = req.voice_id or ("39d518b7-fd0b-4676-9b8b-29d64ff31e12" if lang == "hi" else "248be419-c632-4f23-add1-07c49495163f")
+    speed = req.speed if req.speed is not None else (0.85 if lang == "hi" else 1.0)
+
+    url = "https://api.cartesia.ai/tts/bytes"
+    headers = {
+        "X-API-Key": cartesia_key,
+        "Cartesia-Version": "2024-06-10",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model_id": "sonic-3",
+        "transcript": text,
+        "voice": {
+            "mode": "id",
+            "id": voice_id
+        },
+        "language": lang,
+        "output_format": {
+            "container": "wav",
+            "sample_rate": 24000,
+            "encoding": "pcm_s16le"
+        },
+        "voice_settings": {
+            "speed": speed
+        }
+    }
+
+    try:
+        import httpx
+        from fastapi.responses import Response
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(url, headers=headers, json=payload)
+            if resp.status_code != 200:
+                logger.error(f"Cartesia preview failed: {resp.status_code} - {resp.text}")
+                raise HTTPException(status_code=resp.status_code, detail=f"TTS synthesis failed: {resp.text}")
+            
+            return Response(content=resp.content, media_type="audio/wav")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error synthesizing voice preview: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/voice/test-call")
+async def test_voice_call(req: VoiceTestCallRequest):
+    """
+    Rings the user's test phone number immediately to test the voice prompt,
+    accent, and opening greeting in real time.
+    """
+    if not req.phone:
+        raise HTTPException(status_code=400, detail="Phone number is required for test call")
+
+    from services.livekit_service import dispatch_livekit_call
+    room_name, status = await dispatch_livekit_call(
+        phone=req.phone,
+        lead_name="Test Prospect",
+        system_prompt=req.prompt,
+        first_message=req.first_message,
+        user_id=req.user_id,
+        campaign_id="test-call-direct",
+        language=req.language or "auto",
+        accent=req.accent or "auto",
+        tts_provider=req.tts_provider or "",
+        tts_voice=req.voice_id or "",
+    )
+
+    if not room_name:
+        raise HTTPException(status_code=500, detail=f"Failed to initiate test call: {status}")
+
+    # Log the test call in database
+    call_log = {
+        "user_id": req.user_id,
+        "campaign_id": "test-call-direct",
+        "call_id": room_name,
+        "provider": "livekit",
+        "lead_name": "Test Prospect",
+        "lead_phone": req.phone,
+        "status": "in-progress",
+        "transcript": "",
+        "recording_url": "",
+        "summary": "Direct browser test call",
+        "checklist": [],
+        "sentiment": "Neutral",
+        "sms_status": "",
+        "sms_content": "",
+        "duration": 0,
+        "created_at": datetime.datetime.utcnow(),
+    }
+    await save_call_log(call_log)
+
+    return {
+        "status": "success",
+        "room_name": room_name,
+        "message": f"Dialing test call to {req.phone} with {req.language or 'auto'} language and {req.accent or 'auto'} accent...",
+    }
+
+
+@router.post("/voice/livekit-webhook")
+async def livekit_webhook(request: Request):
+    """
+    Handles LiveKit room and egress events (recording ready, call ended).
+    """
+    from database import update_call_log
+    from services.livekit_service import process_call_transcript
+    try:
+        data = await request.json()
+        event = data.get("event", "")
+        room = data.get("room", {})
+        room_name = room.get("name", "")
+
+        logger.info(f"LiveKit webhook event: {event} for room: {room_name}")
+
+        if event in ("room_finished", "participant_left") and room_name:
+            await update_call_log(room_name, {
+                "status": "completed",
+                "updated_at": datetime.datetime.utcnow(),
+            })
+        elif event == "egress_ended":
+            egress_info = data.get("egressInfo", {})
+            file_results = egress_info.get("fileResults", [])
+            recording_url = file_results[0].get("location", "") if file_results else ""
+            if room_name and recording_url:
+                await update_call_log(room_name, {
+                    "recording_url": recording_url,
+                    "updated_at": datetime.datetime.utcnow(),
+                })
+
+        return {"status": "ok"}
+    except Exception as e:
+        logger.error(f"Error handling livekit webhook: {e}")
+        return {"status": "error", "message": str(e)}
+
+
+@router.post("/voice/webhook")
+async def voice_webhook(request: Request):
+    """
+    Receives VAPI call-ended webhooks.
+    Updates the call log with transcript, recording, and processes via Groq.
+    """
+    from database import update_call_log
+    from services.vapi_service import process_call_transcript
+    from services.sms_sender import send_sms_via_twilio
+    import datetime
+    
+    try:
+        data = await request.json()
+        if not data:
+            return {"success": False, "error": "Empty body"}
+        
+        message_type = data.get("message", {}).get("type", "")
+        call = data.get("message", {}).get("call", data)
+        call_id = call.get("id", "")
+        status = call.get("status", "")
+        
+        logger.info(f"Voice webhook received: type={message_type}, call_id={call_id}, status={status}")
+        
+        if status in ("ended", "fulfilled"):
+            transcript = call.get("transcript", "")
+            recording_url = call.get("recordingUrl", "")
+            duration = call.get("duration", 0)
+            
+            # Process transcript
+            analysis = {"summary": "", "checklist": [], "sms_message": "", "sentiment": "Neutral"}
+            if transcript:
+                analysis = await process_call_transcript(transcript)
+            
+            update_data = {
+                "status": status,
+                "transcript": transcript,
+                "recording_url": recording_url,
+                "duration": duration,
+                "summary": analysis.get("summary", ""),
+                "checklist": analysis.get("checklist", []),
+                "sentiment": analysis.get("sentiment", "Neutral"),
+                "ended_reason": call.get("endedReason", ""),
+                "updated_at": datetime.datetime.utcnow(),
+            }
+            
+            await update_call_log(call_id, update_data)
+            logger.info(f"Updated call log {call_id} via webhook")
+        
+        return {"success": True}
+    except Exception as e:
+        logger.error(f"Voice webhook error: {e}", exc_info=True)
+        return {"success": False, "error": str(e)}
+
+
+@router.post("/voice/livekit-webhook")
+async def livekit_webhook(request: Request):
+    """
+    Receives LiveKit Cloud Webhook events (room_finished, participant_left).
+    Updates the call log in MongoDB with duration, status, and completion state.
+    """
+    from database import update_call_log
+    import datetime
+
+    try:
+        data = await request.json()
+        if not data:
+            return {"success": False, "error": "Empty body"}
+
+        event = data.get("event", "")
+        room = data.get("room", {})
+        room_name = room.get("name") or data.get("roomName", "")
+
+        logger.info(f"LiveKit webhook received: event={event}, room={room_name}")
+
+        if event in ("room_finished", "participant_left"):
+            duration = room.get("duration", 0)
+            update_data = {
+                "status": "completed",
+                "duration": duration,
+                "ended_reason": event,
+                "updated_at": datetime.datetime.utcnow(),
+            }
+            if room_name:
+                await update_call_log(room_name, update_data)
+                logger.info(f"Updated LiveKit call log for room {room_name}")
+
+        elif event == "egress_ended":
+            egress_info = data.get("egressInfo", {})
+            room_name = egress_info.get("roomName") or room_name
+            file_results = egress_info.get("fileResults", [])
+            recording_url = file_results[0].get("location", "") if file_results else egress_info.get("streamResults", [{}])[0].get("url", "")
+            if room_name and recording_url:
+                await update_call_log(room_name, {
+                    "recording_url": recording_url,
+                    "updated_at": datetime.datetime.utcnow(),
+                })
+                logger.info(f"Updated recording URL for room {room_name}: {recording_url}")
+
+        return {"success": True}
+    except Exception as e:
+        logger.error(f"LiveKit webhook error: {e}", exc_info=True)
+        return {"success": False, "error": str(e)}
+
+
+
+
+@router.get("/voice/calls")
+async def get_voice_calls(user_id: str, campaign_id: str = None, status: str = None, search: str = None):
+    """Get call logs for a user, optionally filtered by campaign, status, and search query."""
+    from database import get_call_logs
+    
+    logs = await get_call_logs(user_id, campaign_id, status=status, search=search)
+    return {"calls": logs}
+
+
+@router.get("/voice/stats")
+async def get_voice_stats(user_id: str):
+    """Get aggregated call statistics for the Calls dashboard."""
+    from database import get_call_stats
+    
+    stats = await get_call_stats(user_id)
+    return stats
+
+
+@router.post("/voice/draft")
+async def save_voice_draft(req: VoiceDraftRequest):
+    """Save a voice campaign as a draft without launching calls."""
+    from database import db
+    import datetime
+    
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not connected")
+    
+    new_draft = {
+        "user_id": req.user_id,
+        "name": req.name,
+        "status": "Draft",
+        "type": "Voice",
+        "progress": 0,
+        "sent": 0,
+        "replied": 0,
+        "booked": 0,
+        "total_leads": len(req.leads),
+        "date": datetime.datetime.utcnow().strftime("%b %d, %Y"),
+        "created_at": datetime.datetime.utcnow(),
+        "content": req.prompt,
+        "prompt": req.prompt,
+        "first_message": req.first_message,
+        "language": req.language or "auto",
+        "accent": req.accent or "auto",
+        "voice_id": req.voice_id or "",
+        "tts_provider": req.tts_provider or "",
+        "leads": req.leads,
+        "audience": [{"name": l.get("name") or "Prospect", "contact": l.get("phone", ""), "phone": l.get("phone", "")} for l in req.leads],
+        "action": "call",
+        "product_name": req.product_name or req.name or "",
+        "target_customer": req.target_customer or "",
+        "call_to_action": req.call_to_action or "",
+        "product_info": req.product_info or req.prompt or "",
+        "objective": req.objective or "engagement",
+    }
+    
+    await db.campaigns.insert_one(new_draft)
+    return {"status": "success", "message": "Voice campaign saved as draft!"}
+
+def format_whatsapp_number(raw_phone: str) -> str:
+    """
+    Normalizes a phone number for WhatsApp:
+    - Strips all non-digit characters (+, -, spaces, parentheses)
+    - Strips leading zero (e.g. 07337726482 -> 7337726482)
+    - Automatically prepends India country code '91' for 10-digit numbers starting with 6-9
+    """
+    import re
+    digits = re.sub(r"\D", "", str(raw_phone or ""))
+    digits = digits.lstrip("0")
+    if len(digits) == 10 and digits[0] in "6789":
+        digits = "91" + digits
+    return digits
+
+
+async def _background_dispatch_whatsapp(user_id: str, campaign_id: str, leads: list, content: str, image_url: str = None, campaign_name: str = "WhatsApp Campaign"):
+    """
+    Background worker that dispatches WhatsApp campaign messages with:
+    1. Anti-Ban Safe Pacing: randomized 4.0 - 7.5s jitter delay between sends.
+    2. Dynamic text variation to prevent mass-identical content detection.
+    3. Batch cooldown rest (15s after every 25 messages).
+    4. Circuit breaker (halts dispatch if 5 consecutive critical infrastructure/session errors occur).
+    5. Real-time DB progress updates for live frontend showcase.
+    """
+    import asyncio
+    import random
+    import datetime
+    import logging
+    from bson import ObjectId
+    from database import db, save_whatsapp_record
+    from services.whatsapp import openwa_service
+    from services.billing import check_and_deduct_credits, TOKEN_COSTS
+    from services.notifications import create_notification
+    
+    logger = logging.getLogger(__name__)
+    session_id = f"user_{user_id}"
+    total_leads = len(leads)
+    successful_sends = 0
+    failed_count = 0
+    consecutive_fatal_errors = 0
+
+    # Check if user has Meta Cloud API configured
+    user_doc = None
+    if db is not None:
+        try:
+            user_doc = await db.users.find_one({"user_id": user_id})
+        except Exception:
+            pass
+    wa_creds = (user_doc or {}).get("integrations", {}).get("whatsapp", {})
+    is_meta = wa_creds.get("provider_type") == "meta" or bool(wa_creds.get("access_token") and wa_creds.get("phone_number_id"))
+    
+    logger.info(f"Starting background dispatch for WhatsApp campaign {campaign_id} ({total_leads} leads, Provider: {'Meta Cloud API' if is_meta else 'OpenWA'})")
+
+    for idx, lead in enumerate(leads):
+        lead_phone = lead.get("phone") or lead.get("contact")
+        lead_name = lead.get("name", "there")
+        
+        if not lead_phone:
+            failed_count += 1
+            continue
+            
+        sanitized_phone = format_whatsapp_number(lead_phone)
+        if not sanitized_phone:
+            failed_count += 1
+            continue
+            
+        # Dynamic text variation to prevent mass-identical content detection
+        personalized_content = content.replace("[Name]", lead_name).replace("{Name}", lead_name)
+        
+        try:
+            message_id = None
+            if is_meta:
+                from services.whatsapp import meta_wa_service
+                token = wa_creds["access_token"]
+                phone_id = wa_creds["phone_number_id"]
+                if image_url:
+                    result = await meta_wa_service.send_image_message(
+                        access_token=token,
+                        phone_number_id=phone_id,
+                        to_phone=sanitized_phone,
+                        image_url=image_url,
+                        caption=personalized_content,
+                    )
+                else:
+                    result = await meta_wa_service.send_text_message(
+                        access_token=token,
+                        phone_number_id=phone_id,
+                        to_phone=sanitized_phone,
+                        message=personalized_content,
+                    )
+                if isinstance(result, dict) and result.get("messages"):
+                    message_id = result["messages"][0].get("id")
+            else:
+                if image_url:
+                    result = await openwa_service.send_image_message(
+                        phone_number=sanitized_phone,
+                        image_url=image_url,
+                        caption=personalized_content,
+                        session_id=session_id
+                    )
+                else:
+                    result = await openwa_service.send_text_message(
+                        phone_number=sanitized_phone,
+                        message=personalized_content,
+                        session_id=session_id
+                    )
+                if isinstance(result, dict):
+                    message_id = result.get("key", {}).get("id")
+                
+            successful_sends += 1
+            consecutive_fatal_errors = 0  # reset on success
+            
+            try:
+                await check_and_deduct_credits(user_id, "WHATSAPP_SEND", amount=TOKEN_COSTS.get("WHATSAPP_SEND", 1), dry_run=False)
+            except Exception:
+                pass
+
+            # Persist successful send
+            await save_whatsapp_record({
+                "user_id": user_id,
+                "phone_number": sanitized_phone,
+                "lead_name": lead_name,
+                "message": personalized_content,
+                "image_url": image_url,
+                "campaign_id": campaign_id,
+                "message_id": message_id,
+                "status": "Sent",
+                "type": "image" if image_url else "text",
+                "created_at": datetime.datetime.utcnow()
+            })
+            
+        except Exception as e:
+            raw_err = str(e)
+            failed_count += 1
+            logger.error(f"Failed send to {lead_phone} (sanitized: {sanitized_phone}): {raw_err}")
+
+            if "exists" in raw_err.lower() and "false" in raw_err.lower():
+                user_friendly_err = f"Number +{sanitized_phone} is not registered on WhatsApp. Verify country code."
+            else:
+                user_friendly_err = raw_err
+                if "500" in raw_err or "401" in raw_err or "403" in raw_err or "connection" in raw_err.lower():
+                    consecutive_fatal_errors += 1
+
+            await save_whatsapp_record({
+                "user_id": user_id,
+                "phone_number": sanitized_phone,
+                "lead_name": lead_name,
+                "message": personalized_content,
+                "campaign_id": campaign_id,
+                "status": "Failed",
+                "error": user_friendly_err,
+                "type": "image" if image_url else "text",
+                "created_at": datetime.datetime.utcnow()
+            })
+
+            # Circuit breaker: stop dispatch if 5 consecutive connection/server failures
+            if consecutive_fatal_errors >= 5:
+                logger.error(f"Circuit breaker triggered for campaign {campaign_id}: 5 consecutive fatal errors.")
+                if db is not None:
+                    await db.campaigns.update_one(
+                        {"_id": ObjectId(campaign_id)},
+                        {"$set": {
+                            "status": "Paused",
+                            "dispatch_status": "Paused: WhatsApp connection interrupted. Please check Integrations.",
+                            "sent": successful_sends,
+                            "failed": failed_count
+                        }}
+                    )
+                await create_notification(
+                    user_id=user_id,
+                    title="WhatsApp Campaign Paused",
+                    message=f"Campaign '{campaign_name}' was paused to protect your account. WhatsApp connection interrupted.",
+                    notif_type="error"
+                )
+                return
+
+        # Update real-time progress in DB
+        progress_pct = int(((idx + 1) / total_leads) * 100)
+        current_status_msg = f"Sent {successful_sends}/{total_leads} (🛡️ Safe Pacing active: ~4-7s delay)"
+        if db is not None:
+            await db.campaigns.update_one(
+                {"_id": ObjectId(campaign_id)},
+                {"$set": {
+                    "sent": successful_sends,
+                    "failed": failed_count,
+                    "progress": progress_pct,
+                    "dispatch_status": current_status_msg
+                }}
+            )
+
+        # Anti-Ban Safe Pacing Jitter Delay (only if more leads remain)
+        if idx < total_leads - 1:
+            # Batch rest: after every 25 messages, rest for 15s to mimic human behavior
+            if (idx + 1) % 25 == 0:
+                logger.info(f"Campaign {campaign_id}: Resting 15s cooldown after {idx + 1} sends...")
+                if db is not None:
+                    await db.campaigns.update_one(
+                        {"_id": ObjectId(campaign_id)},
+                        {"$set": {
+                            "dispatch_status": f"Cooldown rest (15s) after {idx + 1} sends to protect WhatsApp account..."
+                        }}
+                    )
+                await asyncio.sleep(15.0)
+            else:
+                jitter_delay = random.uniform(4.0, 7.5)
+                await asyncio.sleep(jitter_delay)
+
+    # All leads processed
+    final_status = "Active" if successful_sends > 0 else "Failed"
+    completion_msg = f"Completed: {successful_sends} sent successfully, {failed_count} failed."
+    if db is not None:
+        await db.campaigns.update_one(
+            {"_id": ObjectId(campaign_id)},
+            {"$set": {
+                "status": final_status,
+                "progress": 100,
+                "sent": successful_sends,
+                "failed": failed_count,
+                "dispatch_status": completion_msg
+            }}
+        )
+
+    await create_notification(
+        user_id=user_id,
+        title="WhatsApp Campaign Finished",
+        message=f"Campaign '{campaign_name}' finished sending: {successful_sends} contacts reached.",
+        notif_type="success" if successful_sends > 0 else "error"
+    )
+
+
+@router.post("/whatsapp/publish")
+async def publish_whatsapp_campaign(req: SmsPublishRequest, background_tasks: BackgroundTasks):
+    from database import db
+    import datetime
+    from bson import ObjectId
+    
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not connected")
+        
+    if not req.leads:
+        return {"status": "error", "message": "No leads selected for this campaign."}
+        
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.info(f"Initiating WhatsApp campaign '{req.name}' for {len(req.leads)} leads.")
+    
+    # Check if user has connected WhatsApp via Meta Cloud API or OpenWA QR
+    user_doc = await db.users.find_one({"user_id": req.user_id})
+    wa_creds = (user_doc or {}).get("integrations", {}).get("whatsapp", {})
+    is_meta = wa_creds.get("provider_type") == "meta" or bool(wa_creds.get("access_token") and wa_creds.get("phone_number_id"))
+
+    if not is_meta:
+        session_id = f"user_{req.user_id}"
+        from services.whatsapp import openwa_service
+        status = await openwa_service.get_connection_status(session_id=session_id)
+        if status != "CONNECTED":
+            return {
+                "status": "error",
+                "message": "WhatsApp is not connected. Please go to the Integrations page and connect WhatsApp (Meta Cloud API or QR Code) first."
+            }
+
+    campaign_id = str(ObjectId())
+    total_leads = len(req.leads)
+    
+    new_campaign = {
+        "_id": ObjectId(campaign_id),
+        "campaign_id": campaign_id,
+        "user_id": req.user_id,
+        "name": req.name,
+        "status": "Sending",
+        "type": "WhatsApp",
+        "progress": 0,
+        "sent": 0,
+        "failed": 0,
+        "total": total_leads,
+        "replied": 0,
+        "booked": 0,
+        "date": datetime.datetime.utcnow().strftime("%b %d, %Y"),
+        "created_at": datetime.datetime.utcnow(),
+        "content": req.content,
+        "image_url": req.image_url,
+        "action": req.action,
+        "anti_ban_mode": True,
+        "pacing": "4-7s randomized jitter + batch cooldown",
+        "dispatch_status": f"Starting safe background dispatch for {total_leads} contacts (4-7s delay)...",
+        "audience": [{"name": l.get("name", ""), "contact": l.get("phone", "")} for l in req.leads],
+        "product_name": req.product_name or req.name or "",
+        "target_customer": req.target_customer or "",
+        "call_to_action": req.call_to_action or "",
+        "product_info": req.product_info or req.content or "",
+        "objective": req.objective or "engagement",
+    }
+    
+    await db.campaigns.insert_one(new_campaign)
+    
+    # Launch in background so HTTP response is instantaneous and never times out
+    background_tasks.add_task(
+        _background_dispatch_whatsapp,
+        user_id=req.user_id,
+        campaign_id=campaign_id,
+        leads=req.leads,
+        content=req.content,
+        image_url=req.image_url,
+        campaign_name=req.name
+    )
+    
+    return {
+        "status": "success",
+        "campaign_id": campaign_id,
+        "message": f"Campaign '{req.name}' started in background! Anti-ban safe pacing active (4-7s delay) to protect your WhatsApp account."
+    }

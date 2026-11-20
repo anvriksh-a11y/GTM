@@ -1,0 +1,12 @@
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+venv/
+antenv/
+.git/
+.vscode/
+test_*.py
+check_phones.py
+update_ammar.py
+script.py

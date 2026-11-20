@@ -1,0 +1,50 @@
+name: Build and deploy Python app to Azure Web App - gtm-backend1
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Prepare production requirements
+        working-directory: ./backend
+        run: cp requirements.prod.txt requirements.txt
+
+      - name: Create deployment package
+        working-directory: ./backend
+        run: |
+          zip -r ../release.zip . \
+            -x "*.pyc" \
+            -x "__pycache__/*" \
+            -x "antenv/*" \
+            -x "venv/*" \
+            -x ".env" \
+            -x "*.png" \
+            -x "*.jpg" \
+            -x "response.json" \
+            -x "test_*.py" \
+            -x "check_phones.py" \
+            -x "add_credits.py" \
+            -x "update_ammar.py" \
+            -x "script.py" \
+            -x "startup.sh"
+
+      - name: Deploy to Azure Web App
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: gtm-backend1
+          slot-name: Production
+          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_E724D499FDA047D384397534B5323A33 }}
+          package: ./release.zip
