@@ -1,5 +1,6 @@
 {
   "hosting": {
+    "site": "geometric-orbit-515305-b2",
     "public": "build",
     "ignore": [
       "firebase.json",
