@@ -31,18 +31,22 @@ ACCESS_TOKEN_URL = "https://www.linkedin.com/oauth/v2/accessToken"
 # Dynamically set redirect URIs based on settings or request headers
 def get_backend_base(request: Request = None) -> str:
     base_url = ""
-    if getattr(settings, "BACKEND_URL", None):
-        base_url = settings.BACKEND_URL
-    elif request:
-        proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+    if request:
         host = request.headers.get("x-forwarded-host", request.url.netloc)
-        if host:
+        proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+        if host and ("localhost" in host or "127.0.0.1" in host):
+            base_url = f"{proto}://{host}"
+        elif getattr(settings, "BACKEND_URL", None):
+            base_url = settings.BACKEND_URL
+        elif host:
             base_url = f"{proto}://{host}"
         else:
             base_url = str(request.base_url)
+    elif getattr(settings, "BACKEND_URL", None):
+        base_url = settings.BACKEND_URL
     else:
         IS_PROD = not settings.DEBUG
-        base_url = "https://gtm-backend1-hmgygeahadebdyc7.canadacentral-01.azurewebsites.net" if IS_PROD else "http://localhost:8000"
+        base_url = "https://gtm-backend-204839757253.us-central1.run.app" if IS_PROD else "http://localhost:8000"
 
     # Clean up base_url to ensure it doesn't have triple slashes or trailing slashes
     base_url = base_url.rstrip("/")
