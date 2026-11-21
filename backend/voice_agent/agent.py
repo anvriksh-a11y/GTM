@@ -531,7 +531,7 @@ if __name__ == "__main__":
             entrypoint_fnc=entrypoint,
             prewarm_fnc=prewarm,
             agent_name="outbound-caller",
-            num_idle_processes=1,
+            num_idle_processes=0,
             initialize_process_timeout=30.0,
         )
     )
