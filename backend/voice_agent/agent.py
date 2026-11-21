@@ -427,11 +427,11 @@ async def entrypoint(ctx: agents.JobContext):
 
     # Logic to dial out:
     # 1. If 'phone_number' is present, we MIGHT need to dial.
-    # 2. Check if a SIP participant is already in the room (Dashboard dispatch case).
-    
+    # 2. Check if a SIP participant is already in the room or already dispatched by backend.
+    sip_dispatched_by_backend = bool(config_dict.get("sip_dispatched"))
     should_dial = False
-    if phone_number:
-        # Check if any remote participant looks like our user (sip_PHONE)
+    
+    if phone_number and not sip_dispatched_by_backend:
         user_already_here = False
         for p in ctx.room.remote_participants.values():
             if f"sip_{phone_number}" in p.identity or "sip_" in p.identity:
@@ -440,9 +440,11 @@ async def entrypoint(ctx: agents.JobContext):
         
         if not user_already_here:
             should_dial = True
-            logger.info("User not in room. Agent will initiate dial-out.")
+            logger.info("User not in room and not pre-dispatched. Agent will initiate dial-out.")
         else:
-            logger.info("User already in room (Dashboard dispatched). output Only generated greeting.")
+            logger.info("User already in room. Outputting greeting.")
+    else:
+        logger.info(f"SIP dial already dispatched by backend (sip_dispatched={sip_dispatched_by_backend}). Waiting for participant to answer...")
 
     if should_dial:
         logger.info(f"Initiating outbound SIP call to {phone_number}...")
@@ -467,7 +469,8 @@ async def entrypoint(ctx: agents.JobContext):
             )
             logger.info(f"Call answered via trunk {target_trunk_id} (Caller ID: {caller_id})! Agent is now listening.")
             call_connected = True
-            call_start_time = datetime.datetime.utcnow()
+            import datetime
+            call_start_time = datetime.datetime.now(datetime.UTC)
             
             # Speak greeting
             await session.generate_reply(
@@ -475,21 +478,29 @@ async def entrypoint(ctx: agents.JobContext):
             )
             
         except Exception as e:
-            logger.error(f"Failed to place outbound call: {e}")
-            call_connected = False
-            # Ensure we clean up if the call fails
-            ctx.shutdown()
+            logger.warning(f"Outbound dial attempt notice ({e}). Checking if participant answers...")
+            try:
+                participant = await ctx.wait_for_participant(timeout=45)
+                call_connected = True
+                call_start_time = datetime.datetime.now(datetime.UTC)
+                logger.info(f"Participant joined/answered: {participant.identity}. Delivering greeting...")
+                await session.generate_reply(instructions=initial_greeting)
+            except Exception as wait_err:
+                logger.error(f"Failed to place outbound call and participant did not answer: {wait_err}")
+                call_connected = False
+                ctx.shutdown()
     else:
         # User is already joining/joined via SIP trunk dispatched by backend
-        logger.info("SIP participant already dispatched. Waiting for participant to answer...")
+        logger.info("SIP participant dispatched by backend. Waiting for participant to answer...")
         try:
-            participant = await ctx.wait_for_participant()
+            participant = await ctx.wait_for_participant(timeout=60)
             call_connected = True
-            call_start_time = datetime.datetime.utcnow()
+            import datetime
+            call_start_time = datetime.datetime.now(datetime.UTC)
             logger.info(f"Participant joined/answered: {participant.identity}. Delivering greeting...")
-            await session.generate_reply(instructions=fallback_greeting)
+            await session.generate_reply(instructions=initial_greeting)
         except Exception as e:
-            logger.warning(f"wait_for_participant notice ({e}). Delivering greeting...")
+            logger.warning(f"wait_for_participant notice ({e}). Delivering fallback greeting...")
             await session.generate_reply(instructions=fallback_greeting)
 
 

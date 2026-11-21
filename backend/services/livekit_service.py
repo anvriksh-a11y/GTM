@@ -254,6 +254,7 @@ async def dispatch_livekit_call(
         "sip_trunk_id": sip_trunk_id,
         "caller_id": caller_id,
         "provider": selected_provider,
+        "sip_dispatched": True,
     }
 
     lk_api = _get_livekit_api()
