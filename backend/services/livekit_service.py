@@ -174,9 +174,10 @@ async def dispatch_livekit_call(
     selected_provider = (telephony_provider or "auto").lower()
     if selected_provider == "auto":
         if is_indian_number:
-            selected_provider = "vobiz" if vobiz_creds else ("sip" if sip_creds else ("twilio" if twilio_creds else "vobiz"))
+            # Indian numbers (+91) strictly route via Vobiz domestic trunk with verified Vobiz Caller ID
+            selected_provider = "vobiz"
         else:
-            selected_provider = "sip" if sip_creds else ("twilio" if twilio_creds else ("vobiz" if vobiz_creds else "twilio"))
+            selected_provider = "sip" if sip_creds else ("twilio" if twilio_creds else "vobiz")
 
     sip_trunk_id = None
     caller_id = None
@@ -189,7 +190,10 @@ async def dispatch_livekit_call(
         caller_id = sip_creds.get("outbound_number") or os.getenv("CUSTOM_SIP_CALLER_ID") or os.getenv("TWILIO_FROM_NUMBER") or "+1234567890"
     else:
         sip_trunk_id = twilio_creds.get("sip_trunk_id") or os.getenv("TWILIO_SIP_TRUNK_ID") or os.getenv("OUTBOUND_TRUNK_ID") or os.getenv("VOBIZ_SIP_TRUNK_ID") or "ST_z4V2wYPm5ar3"
-        caller_id = twilio_creds.get("from_number") or os.getenv("TWILIO_FROM_NUMBER") or os.getenv("VOBIZ_OUTBOUND_NUMBER")
+        if is_indian_number:
+            caller_id = os.getenv("VOBIZ_OUTBOUND_NUMBER") or "+917965853227"
+        else:
+            caller_id = twilio_creds.get("from_number") or os.getenv("TWILIO_FROM_NUMBER") or os.getenv("VOBIZ_OUTBOUND_NUMBER")
 
     # If Custom SIP is connected by user but trunk was not yet provisioned in LiveKit, provision on the fly
     if selected_provider == "sip" and sip_creds and not sip_creds.get("sip_trunk_id") and sip_creds.get("sip_domain") and settings.LIVEKIT_URL:
