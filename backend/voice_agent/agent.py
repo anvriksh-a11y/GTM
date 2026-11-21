@@ -104,9 +104,11 @@ def _build_tts(config_provider: str = None, config_voice: str = None, language: 
         return deepgram.TTS(model=model)
 
     # Fallback to OpenAI
-    logger.info(f"Using OpenAI TTS (Voice: {config_voice or 'alloy'})")
     model = os.getenv("OPENAI_TTS_MODEL", "tts-1")
     voice = config_voice or "alloy"
+    if voice not in ["nova", "shimmer", "echo", "onyx", "fable", "alloy", "ash", "sage", "coral"]:
+        voice = "alloy"
+    logger.info(f"Using OpenAI TTS (Voice: {voice})")
     return openai.TTS(model=model, voice=voice)
 
 
@@ -480,7 +482,7 @@ async def entrypoint(ctx: agents.JobContext):
         except Exception as e:
             logger.warning(f"Outbound dial attempt notice ({e}). Checking if participant answers...")
             try:
-                participant = await ctx.wait_for_participant(timeout=45)
+                participant = await asyncio.wait_for(ctx.wait_for_participant(), timeout=45.0)
                 call_connected = True
                 call_start_time = datetime.datetime.now(datetime.UTC)
                 logger.info(f"Participant joined/answered: {participant.identity}. Delivering greeting...")
@@ -493,7 +495,7 @@ async def entrypoint(ctx: agents.JobContext):
         # User is already joining/joined via SIP trunk dispatched by backend
         logger.info("SIP participant dispatched by backend. Waiting for participant to answer...")
         try:
-            participant = await ctx.wait_for_participant(timeout=60)
+            participant = await asyncio.wait_for(ctx.wait_for_participant(), timeout=60.0)
             call_connected = True
             import datetime
             call_start_time = datetime.datetime.now(datetime.UTC)
