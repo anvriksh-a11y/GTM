@@ -290,8 +290,12 @@ async def entrypoint(ctx: agents.JobContext):
     stt_language = "hi" if call_language.startswith("hi") else ("en-IN" if call_accent in ["in", "indian"] else "en")
 
     # Initialize the Agent Session with plugins
+    vad_model = getattr(getattr(ctx, "proc", None), "userdata", {}).get("vad") if hasattr(ctx, "proc") else None
+    if vad_model is None:
+        vad_model = silero.VAD.load()
+
     session = AgentSession(
-        vad=silero.VAD.load(),
+        vad=vad_model,
         stt=deepgram.STT(model=config.STT_MODEL, language=stt_language), 
         llm=_build_llm(config_dict.get("model_provider")),
         tts=_build_tts(
@@ -308,10 +312,6 @@ async def entrypoint(ctx: agents.JobContext):
     await session.start(
         room=ctx.room,
         agent=OutboundAssistant(tools=list(fnc_ctx.function_tools.values()), instructions=system_prompt),
-        room_input_options=RoomInputOptions(
-            noise_cancellation=noise_cancellation.BVCTelephony(),
-            close_on_disconnect=True, # Close room when agent disconnects
-        ),
     )
 
     # Transcript & Analysis Collector on Call Hangup / Disconnect
@@ -520,11 +520,18 @@ async def entrypoint(ctx: agents.JobContext):
 
 
 
+def prewarm(proc: agents.JobProcess):
+    """Pre-load VAD model at worker boot to eliminate cold-start speech delay."""
+    proc.userdata["vad"] = silero.VAD.load()
+
+
 if __name__ == "__main__":
-    # The agent name "outbound-caller" is used by the dispatch script to find this worker
     agents.cli.run_app(
         agents.WorkerOptions(
             entrypoint_fnc=entrypoint,
-            agent_name="outbound-caller", 
+            prewarm_fnc=prewarm,
+            agent_name="outbound-caller",
+            num_idle_processes=1,
+            initialize_process_timeout=30.0,
         )
     )
