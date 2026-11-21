@@ -474,10 +474,13 @@ async def entrypoint(ctx: agents.JobContext):
             import datetime
             call_start_time = datetime.datetime.now(datetime.UTC)
             
-            # Speak greeting
-            await session.generate_reply(
-                instructions=initial_greeting
-            )
+            # Speak greeting immediately using TTS
+            logger.info(f"Delivering initial greeting via TTS: {initial_greeting}")
+            try:
+                await session.say(initial_greeting)
+            except Exception as say_err:
+                logger.warning(f"session.say error ({say_err}), falling back to generate_reply...")
+                await session.generate_reply(instructions=initial_greeting)
             
         except Exception as e:
             logger.warning(f"Outbound dial attempt notice ({e}). Checking if participant answers...")
@@ -486,7 +489,10 @@ async def entrypoint(ctx: agents.JobContext):
                 call_connected = True
                 call_start_time = datetime.datetime.now(datetime.UTC)
                 logger.info(f"Participant joined/answered: {participant.identity}. Delivering greeting...")
-                await session.generate_reply(instructions=initial_greeting)
+                try:
+                    await session.say(initial_greeting)
+                except Exception as say_err:
+                    await session.generate_reply(instructions=initial_greeting)
             except Exception as wait_err:
                 logger.error(f"Failed to place outbound call and participant did not answer: {wait_err}")
                 call_connected = False
@@ -499,11 +505,18 @@ async def entrypoint(ctx: agents.JobContext):
             call_connected = True
             import datetime
             call_start_time = datetime.datetime.now(datetime.UTC)
-            logger.info(f"Participant joined/answered: {participant.identity}. Delivering greeting...")
-            await session.generate_reply(instructions=initial_greeting)
+            logger.info(f"Participant joined/answered: {participant.identity}. Delivering initial greeting via TTS...")
+            try:
+                await session.say(initial_greeting)
+            except Exception as say_err:
+                logger.warning(f"session.say error ({say_err}), fallback to generate_reply...")
+                await session.generate_reply(instructions=initial_greeting)
         except Exception as e:
             logger.warning(f"wait_for_participant notice ({e}). Delivering fallback greeting...")
-            await session.generate_reply(instructions=fallback_greeting)
+            try:
+                await session.say(fallback_greeting)
+            except Exception as say_err:
+                await session.generate_reply(instructions=fallback_greeting)
 
 
 
