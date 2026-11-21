@@ -3,6 +3,10 @@ const getBaseUrl = () => {
     return import.meta.env.VITE_API_URL;
   }
   if (typeof window !== 'undefined') {
+    // If running on Firebase Hosting (GCP)
+    if (window.location.hostname.includes('web.app') || window.location.hostname.includes('firebaseapp.com')) {
+      return 'https://gtm-backend-204839757253.us-central1.run.app';
+    }
     // If we are running on the production Azure URL
     if (window.location.hostname.includes('azurestaticapps.net') || window.location.hostname.includes('green-dune')) {
       return 'https://gtm-backend1-hmgygeahadebdyc7.canadacentral-01.azurewebsites.net';

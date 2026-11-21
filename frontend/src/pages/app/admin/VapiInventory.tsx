@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { Mic, Archive, RefreshCw, Search } from 'lucide-react';
+import { apiFetch } from '../../../utils/api';
 
 interface VapiAssistant {
   campaign_id: string;
@@ -9,20 +10,6 @@ interface VapiAssistant {
   status: string;
   created_at: string;
 }
-
-const getBaseUrl = () => {
-  if (import.meta.env.VITE_API_URL) {
-    return import.meta.env.VITE_API_URL;
-  }
-  if (typeof window !== 'undefined') {
-    if (window.location.hostname.includes('azurestaticapps.net') || window.location.hostname.includes('green-dune')) {
-      return 'https://gtm-backend1-hmgygeahadebdyc7.canadacentral-01.azurewebsites.net';
-    }
-  }
-  return 'http://localhost:8000';
-};
-
-const API_BASE = getBaseUrl();
 
 export default function AdminVapiInventory() {
   const [assistants, setAssistants] = useState<VapiAssistant[]>([]);
@@ -39,9 +26,7 @@ export default function AdminVapiInventory() {
   const fetchAssistants = useCallback(async () => {
     setLoading(true);
     try {
-      const res = await fetch(`${API_BASE}/api/v1/admin/vapi-assistants`, { credentials: 'include' });
-      if (!res.ok) throw new Error('Failed to fetch assistants');
-      const data = await res.json();
+      const data = await apiFetch('/api/v1/admin/vapi-assistants');
       setAssistants(data.assistants || []);
     } catch (err: any) {
       showToast(err.message || 'Failed to load assistants', 'error');
@@ -58,11 +43,9 @@ export default function AdminVapiInventory() {
     if (!confirm('Force-archive this Vapi assistant? This will set the campaign status to Archived.')) return;
     setActionLoading(campaignId);
     try {
-      const res = await fetch(`${API_BASE}/api/v1/admin/vapi-assistants/${campaignId}/archive`, {
+      await apiFetch(`/api/v1/admin/vapi-assistants/${campaignId}/archive`, {
         method: 'PATCH',
-        credentials: 'include',
       });
-      if (!res.ok) throw new Error('Archive failed');
       showToast('Assistant archived successfully', 'success');
       fetchAssistants();
     } catch (err: any) {

@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { Users, RefreshCw, UserCheck, UserX, Bell, Search, ChevronLeft, ChevronRight, Coins, X } from 'lucide-react';
 import { useAuth } from '../../../context/AuthContext';
+import { apiFetch } from '../../../utils/api';
 
 interface UserRecord {
   user_id: string;
@@ -15,20 +16,6 @@ interface UserRecord {
   lead_count: number;
   created_at: string;
 }
-
-const getBaseUrl = () => {
-  if (import.meta.env.VITE_API_URL) {
-    return import.meta.env.VITE_API_URL;
-  }
-  if (typeof window !== 'undefined') {
-    if (window.location.hostname.includes('azurestaticapps.net') || window.location.hostname.includes('green-dune')) {
-      return 'https://gtm-backend1-hmgygeahadebdyc7.canadacentral-01.azurewebsites.net';
-    }
-  }
-  return 'http://localhost:8000';
-};
-
-const API_BASE = getBaseUrl();
 
 export default function AdminUsers() {
   const { user: currentUser, checkSession } = useAuth();
@@ -51,11 +38,7 @@ export default function AdminUsers() {
   const fetchUsers = useCallback(async () => {
     setLoading(true);
     try {
-      const res = await fetch(`${API_BASE}/api/v1/admin/users?page=${page}&limit=${LIMIT}`, {
-        credentials: 'include',
-      });
-      if (!res.ok) throw new Error('Failed to fetch users');
-      const data = await res.json();
+      const data = await apiFetch(`/api/v1/admin/users?page=${page}&limit=${LIMIT}`);
       setUsers(data.users || []);
       setTotal(data.total || 0);
     } catch (err: any) {
@@ -72,13 +55,10 @@ export default function AdminUsers() {
   const toggleStatus = async (userId: string, currentStatus: boolean) => {
     setActionLoading(userId);
     try {
-      const res = await fetch(`${API_BASE}/api/v1/admin/users/${userId}/status`, {
+      await apiFetch(`/api/v1/admin/users/${userId}/status`, {
         method: 'PATCH',
-        credentials: 'include',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ is_active: !currentStatus }),
+        bodyData: { is_active: !currentStatus },
       });
-      if (!res.ok) throw new Error('Failed to update status');
       const action = currentStatus ? 'deactivated' : 'activated';
       showToast(`User ${action} successfully`, 'success');
       fetchUsers();
@@ -92,11 +72,9 @@ export default function AdminUsers() {
   const sendReconnectNotification = async (userId: string) => {
     setActionLoading(`notify-${userId}`);
     try {
-      const res = await fetch(`${API_BASE}/api/v1/admin/users/${userId}/notify-reconnect`, {
+      await apiFetch(`/api/v1/admin/users/${userId}/notify-reconnect`, {
         method: 'POST',
-        credentials: 'include',
       });
-      if (!res.ok) throw new Error('Failed to send notification');
       showToast('Reconnect notification sent', 'success');
     } catch (err: any) {
       showToast(err.message || 'Failed to send notification', 'error');
@@ -115,14 +93,10 @@ export default function AdminUsers() {
 
     setActionLoading(`tokens-${tokenModalUser.user_id}`);
     try {
-      const res = await fetch(`${API_BASE}/api/v1/admin/users/${tokenModalUser.user_id}/add-tokens`, {
+      const data = await apiFetch(`/api/v1/admin/users/${tokenModalUser.user_id}/add-tokens`, {
         method: 'POST',
-        credentials: 'include',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ amount }),
+        bodyData: { amount },
       });
-      if (!res.ok) throw new Error('Failed to update tokens');
-      const data = await res.json();
       showToast(`Successfully updated tokens. New balance: ${data.new_balance.toLocaleString()}`, 'success');
       setTokenModalUser(null);
       fetchUsers();
