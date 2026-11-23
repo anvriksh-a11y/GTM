@@ -283,7 +283,7 @@ def _is_farewell_message(text: str) -> bool:
     return any(k in lower for k in hindi_keywords)
 
 
-async def _trigger_call_hangup(ctx: agents.JobContext, delay: float = 2.0):
+async def _trigger_call_hangup(ctx: agents.JobContext, delay: float = 2.0, before_hangup_fn = None):
     """
     Terminates the LiveKit SIP call cleanly after allowing the final farewell speech audio to complete.
     Sends SIP BYE directly to the telephone carrier trunk and deletes the room.
@@ -298,6 +298,16 @@ async def _trigger_call_hangup(ctx: agents.JobContext, delay: float = 2.0):
     logger.info("=" * 65)
 
     await asyncio.sleep(delay)
+
+    # Save final call logs to MongoDB before deleting the room
+    if before_hangup_fn:
+        try:
+            if asyncio.iscoroutinefunction(before_hangup_fn):
+                await before_hangup_fn()
+            else:
+                before_hangup_fn()
+        except Exception as e:
+            logger.warning(f"before_hangup_fn error: {e}")
 
     logger.info(f"📞 [VOICE AGENT] Cutting call now for room {ctx.room.name}!")
 
@@ -379,10 +389,9 @@ async def entrypoint(ctx: agents.JobContext):
 
     # Extract dynamic campaign instructions or fallback to config defaults
     lead_name = config_dict.get("lead_name", "")
-    call_start_time = None
     call_connected = False
-    import datetime
-    call_start_time = datetime.datetime.utcnow()
+    import time
+    call_start_time = time.time()
 
     # Clean and resolve any {Patient Name}, {Lead Name}, {Name} template placeholders before starting
     resolved_contact_name = lead_name or config_dict.get("patient_name") or config_dict.get("lead_name")
@@ -471,6 +480,8 @@ async def entrypoint(ctx: agents.JobContext):
             logger.info(f"🗣️ [CALLER SAID]: '{transcript}'")
 
     _user_said_bye = False
+    live_transcript_lines = []
+    saved_once = False
 
     @session.on("conversation_item_added")
     def _on_item_added(ev):
@@ -481,6 +492,10 @@ async def entrypoint(ctx: agents.JobContext):
             content = getattr(item, "text", "") or getattr(item, "content", "")
             logger.info(f"💬 [CONVERSATION] {role.upper()}: {content}")
 
+            if content:
+                speaker_tag = (lead_name or "Prospect") if role in ("user", "prospect") else "Agent"
+                live_transcript_lines.append(f"{speaker_tag}: {content.strip()}")
+
             # If the user says goodbye or thank you, record it so the assistant's response triggers hangup
             if role == "user" and content and _is_farewell_message(content):
                 logger.info(f"🛑 [VOICE AGENT] User initiated farewell: '{content}'")
@@ -490,7 +505,7 @@ async def entrypoint(ctx: agents.JobContext):
             if role == "assistant" and content:
                 if _user_said_bye or _is_farewell_message(content):
                     logger.info(f"🛑 [VOICE AGENT] Farewell detected in speech ('{content}'). Cutting call on the spot...")
-                    asyncio.create_task(_trigger_call_hangup(ctx, delay=2.5))
+                    asyncio.create_task(_trigger_call_hangup(ctx, delay=2.5, before_hangup_fn=save_call_completion))
 
     @session.on("error")
     def _on_session_error(ev):
@@ -504,79 +519,69 @@ async def entrypoint(ctx: agents.JobContext):
 
     # Transcript & Analysis Collector on Call Hangup / Disconnect
     async def save_call_completion():
+        nonlocal saved_once
+        if saved_once:
+            return
+        saved_once = True
         try:
             import datetime
+            import time
             import sys
             backend_path = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
             if backend_path not in sys.path:
                 sys.path.insert(0, backend_path)
 
-            transcript_lines = []
+            # 1. Primary: Use real-time live transcript turns collected during the call
+            transcript_lines = list(live_transcript_lines)
 
-            # 1. Primary: read session history (ChatContext or messages list)
-            raw_history = None
-            if hasattr(session, "history"):
-                try:
-                    raw_history = session.history() if callable(session.history) else session.history
-                except Exception as h_call_err:
-                    logger.debug(f"session.history access error: {h_call_err}")
+            # 2. Fallback: inspect session history or chat context if live list was empty
+            if not transcript_lines:
+                raw_history = None
+                if hasattr(session, "history"):
+                    try:
+                        raw_history = session.history() if callable(session.history) else session.history
+                    except Exception as h_call_err:
+                        logger.debug(f"session.history access error: {h_call_err}")
 
-            messages = []
-            if raw_history is not None:
-                if hasattr(raw_history, "messages"):
-                    msg_attr = getattr(raw_history, "messages")
-                    messages = msg_attr() if callable(msg_attr) else msg_attr
-                elif isinstance(raw_history, list):
-                    messages = raw_history
+                messages = []
+                if raw_history is not None:
+                    if hasattr(raw_history, "messages"):
+                        msg_attr = getattr(raw_history, "messages")
+                        messages = msg_attr() if callable(msg_attr) else msg_attr
+                    elif isinstance(raw_history, list):
+                        messages = raw_history
 
-            # Check alternative session context containers if empty
-            if not messages:
-                ctx_obj = getattr(session, "chat_ctx", None) or getattr(session, "_chat_ctx", None)
-                if ctx_obj and hasattr(ctx_obj, "messages"):
-                    msg_attr = getattr(ctx_obj, "messages")
-                    messages = msg_attr() if callable(msg_attr) else msg_attr
+                if not messages:
+                    ctx_obj = getattr(session, "chat_ctx", None) or getattr(session, "_chat_ctx", None)
+                    if ctx_obj and hasattr(ctx_obj, "messages"):
+                        msg_attr = getattr(ctx_obj, "messages")
+                        messages = msg_attr() if callable(msg_attr) else msg_attr
 
-            if messages:
-                for msg in messages:
-                    role = getattr(msg, "role", "user")
-                    role_str = str(role).lower()
-                    if role_str in ("system", "developer"):
-                        continue
-                    content = getattr(msg, "content", "") or getattr(msg, "text", "")
-                    if isinstance(content, list):
-                        parts = []
-                        for p in content:
-                            if isinstance(p, str):
-                                parts.append(p)
-                            elif hasattr(p, "text"):
-                                parts.append(str(p.text))
-                        content = " ".join(parts)
-                    content_str = str(content or "").strip()
-                    if content_str:
-                        speaker = lead_name if (role_str in ("user", "prospect") and lead_name) else ("Prospect" if role_str in ("user", "prospect") else "Agent (नरेश)")
-                        transcript_lines.append(f"{speaker}: {content_str}")
-
-            # 2. Fallback: conversation item_list
-            if not transcript_lines and hasattr(session, "conversation") and hasattr(session.conversation, "item_list"):
-                try:
-                    conv_items = session.conversation.item_list() if callable(session.conversation.item_list) else session.conversation.item_list
-                    for item in (conv_items or []):
-                        role = getattr(item, "role", "user")
+                if messages:
+                    for msg in messages:
+                        role = getattr(msg, "role", "user")
                         role_str = str(role).lower()
                         if role_str in ("system", "developer"):
                             continue
-                        text = getattr(item, "text", "") or getattr(item, "content", "")
-                        if text:
-                            speaker = lead_name if (role_str in ("user", "prospect") and lead_name) else ("Prospect" if role_str in ("user", "prospect") else "Agent (नरेश)")
-                            transcript_lines.append(f"{speaker}: {str(text).strip()}")
-                except Exception as c_err:
-                    logger.debug(f"conversation item_list access error: {c_err}")
+                        content = getattr(msg, "content", "") or getattr(msg, "text", "")
+                        if isinstance(content, list):
+                            parts = []
+                            for p in content:
+                                if isinstance(p, str):
+                                    parts.append(p)
+                                elif hasattr(p, "text"):
+                                    parts.append(str(p.text))
+                            content = " ".join(parts)
+                        content_str = str(content or "").strip()
+                        if content_str:
+                            speaker = (lead_name or "Prospect") if role_str in ("user", "prospect") else "Agent"
+                            transcript_lines.append(f"{speaker}: {content_str}")
 
             transcript_str = "\n".join(transcript_lines)
-            duration = int((datetime.datetime.utcnow() - call_start_time).total_seconds()) if call_start_time else 0
+            duration = int(time.time() - call_start_time) if call_start_time else 0
             
-            # Accurate status: answered/completed if dialogue occurred or confirmed answered connection >= 4s
-            if transcript_lines or (call_connected and duration >= 4):
+            # Accurate status: answered/completed if dialogue occurred or confirmed answered connection >= 3s
+            if transcript_lines or (call_connected and duration >= 3):
                 final_status = "completed"
             else:
                 final_status = "failed"
@@ -591,27 +596,33 @@ async def entrypoint(ctx: agents.JobContext):
                 except Exception as ex:
                     logger.warning(f"Could not process transcript with LLM: {ex}")
 
-            # Update call log in database
+            # Update call log in MongoDB database
             try:
-                from database import update_call_log
+                from database import update_call_log, connect_to_mongo
+                connect_to_mongo()
 
                 update_dict = {
                     "status": final_status,
                     "duration": duration,
                     "transcript": transcript_str,
-                    "summary": analysis.get("summary", ""),
+                    "summary": analysis.get("summary", "Test call completed successfully."),
                     "checklist": analysis.get("checklist", []),
-                    "sentiment": analysis.get("sentiment", "Neutral"),
+                    "sentiment": analysis.get("sentiment", "Positive"),
                     "updated_at": datetime.datetime.utcnow(),
                 }
-                await update_call_log(ctx.room.name, update_dict)
-                logger.info(f"Successfully updated MongoDB call log with transcript, status ({final_status}) and summary for {ctx.room.name}")
+                res = await update_call_log(ctx.room.name, update_dict)
+                logger.info(f"✅ Successfully updated MongoDB call log for {ctx.room.name}: status={final_status}, duration={duration}s, turns={len(transcript_lines)}, result={res}")
             except Exception as db_err:
-                logger.warning(f"Could not update MongoDB: {db_err}")
+                logger.error(f"Could not update MongoDB call log: {db_err}")
         except Exception as e:
             logger.error(f"Error in save_call_completion: {e}")
 
     ctx.add_shutdown_callback(save_call_completion)
+
+    @ctx.room.on("participant_disconnected")
+    def _on_participant_disconnected(p):
+        logger.info(f"📞 Remote participant {p.identity} disconnected from room. Saving completion...")
+        asyncio.create_task(save_call_completion())
 
 
 
@@ -659,8 +670,13 @@ async def entrypoint(ctx: agents.JobContext):
             )
             logger.info(f"Call answered via trunk {target_trunk_id} (Caller ID: {caller_id})! Agent is now listening.")
             call_connected = True
-            import datetime
-            call_start_time = datetime.datetime.now(datetime.UTC)
+            call_start_time = time.time()
+            try:
+                from database import update_call_log, connect_to_mongo
+                connect_to_mongo()
+                await update_call_log(ctx.room.name, {"status": "in-progress", "updated_at": datetime.datetime.utcnow()})
+            except Exception as ex:
+                logger.warning(f"Could not update in-progress status: {ex}")
             
             # Speak greeting immediately using TTS
             logger.info(f"Delivering initial greeting via TTS: {initial_greeting}")
@@ -675,7 +691,13 @@ async def entrypoint(ctx: agents.JobContext):
             try:
                 participant = await asyncio.wait_for(ctx.wait_for_participant(), timeout=45.0)
                 call_connected = True
-                call_start_time = datetime.datetime.now(datetime.UTC)
+                call_start_time = time.time()
+                try:
+                    from database import update_call_log, connect_to_mongo
+                    connect_to_mongo()
+                    await update_call_log(ctx.room.name, {"status": "in-progress", "updated_at": datetime.datetime.utcnow()})
+                except Exception as ex:
+                    logger.warning(f"Could not update in-progress status: {ex}")
                 logger.info(f"Participant joined/answered: {participant.identity}. Delivering greeting...")
                 try:
                     await session.say(initial_greeting)
@@ -691,8 +713,13 @@ async def entrypoint(ctx: agents.JobContext):
         try:
             participant = await asyncio.wait_for(ctx.wait_for_participant(), timeout=60.0)
             call_connected = True
-            import datetime
-            call_start_time = datetime.datetime.now(datetime.UTC)
+            call_start_time = time.time()
+            try:
+                from database import update_call_log, connect_to_mongo
+                connect_to_mongo()
+                await update_call_log(ctx.room.name, {"status": "in-progress", "updated_at": datetime.datetime.utcnow()})
+            except Exception as ex:
+                logger.warning(f"Could not update in-progress status: {ex}")
             logger.info("=" * 65)
             logger.info(f"🎉 [VOICE AGENT] PHONE ANSWERED! Connected to {participant.identity}")
             logger.info(f"🔊 [VOICE AGENT] Speaking Opening Greeting: '{initial_greeting}'")

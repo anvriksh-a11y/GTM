@@ -102,6 +102,9 @@ async def save_integration_token(user_id: str, platform: str, token_data: dict):
 
 async def save_call_log(call_data: dict):
     """Save an individual call log record to the call_logs collection."""
+    global db
+    if db is None:
+        connect_to_mongo()
     if db is None:
         logger.warning("MongoDB is not connected. Call log will not be saved.")
         return None
@@ -115,15 +118,20 @@ async def save_call_log(call_data: dict):
 
 
 async def update_call_log(call_id: str, update_data: dict):
-    """Update a call log by VAPI call_id."""
+    """Update a call log by call_id or room_name."""
+    global db
     if db is None:
+        connect_to_mongo()
+    if db is None:
+        logger.error(f"MongoDB not connected. Cannot update call log {call_id}.")
         return False
     try:
         result = await db.call_logs.update_one(
-            {"call_id": call_id},
+            {"$or": [{"call_id": call_id}, {"room_name": call_id}]},
             {"$set": update_data}
         )
-        return result.modified_count > 0
+        logger.info(f"Updated call log {call_id}: matched={result.matched_count}, modified={result.modified_count}")
+        return result.matched_count > 0
     except Exception as e:
         logger.error(f"Failed to update call log {call_id}: {e}")
         return False
@@ -131,6 +139,9 @@ async def update_call_log(call_id: str, update_data: dict):
 
 async def get_call_logs(user_id: str, campaign_id: str = None, status: str = None, search: str = None, limit: int = 150):
     """Retrieve call logs for a user, optionally filtered by campaign, status, and search query."""
+    global db
+    if db is None:
+        connect_to_mongo()
     if db is None:
         return []
     try:
