@@ -99,6 +99,39 @@ CTA: {call_to_action or 'Book a consultation/demo'}"""
     return raw_prompt
 
 
+def resolve_template_placeholders(text: str, name: str = None) -> str:
+    """
+    Replaces all template placeholders like {Patient Name}, {Lead Name}, {Name}, etc.
+    with the actual person's name or a natural address.
+    Also strips out any prompt engineering instructions/notes that shouldn't be spoken out loud.
+    """
+    if not text:
+        return ""
+    import re
+    resolved_name = (name or "").strip()
+    if resolved_name in ["Test Preview User", "Test Prospect", "Test User", ""]:
+        resolved_name = "Raj"
+    name_patterns = [
+        r"\{[Pp]atient[_\s]?[Nn]ame\}",
+        r"\{[Ll]ead[_\s]?[Nn]ame\}",
+        r"\{[Cc]ustomer[_\s]?[Nn]ame\}",
+        r"\{[Cc]ontact[_\s]?[Nn]ame\}",
+        r"\{[Uu]ser[_\s]?[Nn]ame\}",
+        r"\{[Ff]irst[_\s]?[Nn]ame\}",
+        r"\{[Nn]ame\}",
+        r"\{[Pp]atient\}",
+        r"\{[Ll]ead\}",
+    ]
+    result = text
+    for pat in name_patterns:
+        result = re.sub(pat, resolved_name, result)
+    # Strip any meta instructions like 'Notice that {Patient Name} was spoken literally...'
+    result = re.sub(r"(?i)notice that.*?before starting the conversation\.?", "", result)
+    # Strip any remaining unreplaced {variable} patterns so raw brackets are never spoken literally
+    result = re.sub(r"\{[A-Za-z0-9_\s]+\}", resolved_name, result)
+    return result.strip()
+
+
 async def dispatch_livekit_call(
     phone: str,
     lead_name: str,
@@ -121,6 +154,10 @@ async def dispatch_livekit_call(
     from database import db
     normalized_phone = normalize_phone_number(phone)
     room_name = f"call-{normalized_phone.replace('+', '')}-{random.randint(1000, 9999)}"
+
+    # Clean and resolve any {Patient Name}, {Lead Name}, or template variables before starting
+    system_prompt = resolve_template_placeholders(system_prompt, lead_name)
+    first_message = resolve_template_placeholders(first_message, lead_name)
 
     # Auto-detect language and accent if set to "auto" or empty
     combined_text = f"{system_prompt} {first_message}"

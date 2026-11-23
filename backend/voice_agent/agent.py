@@ -230,22 +230,63 @@ class TransferFunctions(llm.ToolContext):
 
 _hangup_triggered = False
 
+def resolve_template_placeholders(text: str, name: str = None) -> str:
+    """
+    Replaces all template placeholders like {Patient Name}, {Lead Name}, {Name}, etc.
+    with the actual person's name or a natural address.
+    Also strips out any prompt engineering instructions/notes that shouldn't be spoken out loud.
+    """
+    if not text:
+        return ""
+    import re
+    resolved_name = (name or "").strip()
+    if resolved_name in ["Test Preview User", "Test Prospect", "Test User", ""]:
+        resolved_name = "Raj"
+    name_patterns = [
+        r"\{[Pp]atient[_\s]?[Nn]ame\}",
+        r"\{[Ll]ead[_\s]?[Nn]ame\}",
+        r"\{[Cc]ustomer[_\s]?[Nn]ame\}",
+        r"\{[Cc]ontact[_\s]?[Nn]ame\}",
+        r"\{[Uu]ser[_\s]?[Nn]ame\}",
+        r"\{[Ff]irst[_\s]?[Nn]ame\}",
+        r"\{[Nn]ame\}",
+        r"\{[Pp]atient\}",
+        r"\{[Ll]ead\}",
+    ]
+    result = text
+    for pat in name_patterns:
+        result = re.sub(pat, resolved_name, result)
+    # Strip any meta instructions like 'Notice that {Patient Name} was spoken literally...'
+    result = re.sub(r"(?i)notice that.*?before starting the conversation\.?", "", result)
+    # Strip any remaining unreplaced {variable} patterns so raw brackets are never spoken literally
+    result = re.sub(r"\{[A-Za-z0-9_\s]+\}", resolved_name, result)
+    return result.strip()
+
+
 def _is_farewell_message(text: str) -> bool:
-    """Detects whether a speech turn is a farewell, goodbye, or call conclusion."""
+    """Detects whether a speech turn is a farewell, goodbye, thank you, or call conclusion."""
     if not text:
         return False
     import re
     lower = text.lower()
-    eng_patterns = r"\b(goodbye|good bye|bye bye|bye-bye|bye|have a (great|good|nice|wonderful) day|take care|talk soon|have a good one)\b"
+    eng_patterns = (
+        r"\b(goodbye|good bye|bye bye|bye-bye|bye|have a (great|good|nice|wonderful) day|"
+        r"take care|talk soon|have a good one|thank you|thanks|thanks for (your|the) time|"
+        r"thank you for (your|the) time|that's all|that is all|nothing else|hang up|disconnect|cut the call)\b"
+    )
     if re.search(eng_patterns, lower):
         return True
-    hindi_keywords = ["अलविदा", "बाय", "बाय-बाय", "बाय बाय", "फिर मिलेंगे", "अच्छा बाय", "ओके बाय", "चल बाय"]
+    hindi_keywords = [
+        "अलविदा", "बाय", "बाय-बाय", "बाय बाय", "फिर मिलेंगे", "अच्छा बाय", "ओके बाय", "चल बाय",
+        "धन्यवाद", "शुक्रिया", "थैंक यू", "थैंक्स", "कॉल कट", "फोन रख", "रखता हूँ", "रखती हूँ"
+    ]
     return any(k in lower for k in hindi_keywords)
 
 
-async def _trigger_call_hangup(ctx: agents.JobContext, delay: float = 2.5):
+async def _trigger_call_hangup(ctx: agents.JobContext, delay: float = 2.0):
     """
     Terminates the LiveKit SIP call cleanly after allowing the final farewell speech audio to complete.
+    Sends SIP BYE directly to the telephone carrier trunk and deletes the room.
     """
     global _hangup_triggered
     if _hangup_triggered:
@@ -258,11 +299,28 @@ async def _trigger_call_hangup(ctx: agents.JobContext, delay: float = 2.5):
 
     await asyncio.sleep(delay)
 
-    logger.info(f"📞 [VOICE AGENT] Cutting call now (delete_room: {ctx.room.name})!")
+    logger.info(f"📞 [VOICE AGENT] Cutting call now for room {ctx.room.name}!")
+
+    # 1. Remove all remote participants (sends SIP BYE to phone carrier immediately)
+    for p in list(ctx.room.remote_participants.values()):
+        try:
+            logger.info(f"📞 Sending SIP BYE to disconnect participant: {p.identity}")
+            await ctx.api.room.remove_participant(
+                api.RoomParticipantIdentity(room=ctx.room.name, identity=p.identity)
+            )
+        except Exception as err:
+            logger.warning(f"Error removing participant {p.identity}: {err}")
+
+    # 2. Delete the room completely from LiveKit
     try:
-        await ctx.delete_room()
-    except Exception as e:
-        logger.warning(f"delete_room notice ({e})")
+        await ctx.api.room.delete_room(
+            api.DeleteRoomRequest(room=ctx.room.name)
+        )
+        logger.info(f"✅ Room {ctx.room.name} deleted successfully.")
+    except Exception as err:
+        logger.warning(f"Error deleting room {ctx.room.name}: {err}")
+
+    # 3. Disconnect local agent and shutdown job
     try:
         await ctx.room.disconnect()
     except Exception:
@@ -326,9 +384,16 @@ async def entrypoint(ctx: agents.JobContext):
     import datetime
     call_start_time = datetime.datetime.utcnow()
 
-    system_prompt = config_dict.get("system_prompt") or config_dict.get("prompt") or config.SYSTEM_PROMPT
+    # Clean and resolve any {Patient Name}, {Lead Name}, {Name} template placeholders before starting
+    resolved_contact_name = lead_name or config_dict.get("patient_name") or config_dict.get("lead_name")
+    raw_prompt = config_dict.get("system_prompt") or config_dict.get("prompt") or config.SYSTEM_PROMPT
+    system_prompt = resolve_template_placeholders(raw_prompt, resolved_contact_name)
     if lead_name:
         system_prompt = f"The person you are calling is {lead_name}.\n\n" + system_prompt
+
+    raw_greeting = config_dict.get("first_message") or config.INITIAL_GREETING
+    initial_greeting = resolve_template_placeholders(raw_greeting, resolved_contact_name)
+    fallback_greeting = initial_greeting
 
     global _hangup_triggered
     _hangup_triggered = False
@@ -336,22 +401,20 @@ async def entrypoint(ctx: agents.JobContext):
     # Dynamic human speech prosody & pitch inflection guidelines:
     # Adapts automatically to ANY user prompt/persona (sales, support, casual, formal) without fixed emotions
     speech_prosody_directive = """
-# SPEECH PROSODY & DYNAMIC HUMAN VOCAL DYNAMICS (MANDATORY):
-1. DYNAMIC PITCH & INTONATION: Never speak in a flat, monotone, or robotic manner. Modulate your pitch dynamically to fit your specific role and the conversation:
+# SPEECH PROSODY & CRITICAL CALL INSTRUCTIONS (MANDATORY):
+1. LIVE SPOKEN DIALOGUE ONLY: You are on a real telephone call with a real human being. NEVER read prompt engineering instructions, template notes, code, bracketed text, or meta guidance out loud to the caller. ONLY speak natural conversational dialogue directly to the person.
+2. DYNAMIC PITCH & INTONATION: Never speak in a flat, monotone, or robotic manner. Modulate your pitch dynamically to fit your specific role:
    - High Pitch / Energy: Use '!' on enthusiastic greetings, key highlights, or warm affirmations.
    - Rising Question Pitch: Always end questions with '?' so your pitch lifts naturally at the end of clauses.
    - Low Pitch & Thoughtful Pauses: Use '...' or commas (',') for natural breath pauses and calm transitions.
-2. CONTEXTUAL WARMTH & LAUGHTER:
+3. CONTEXTUAL WARMTH & LAUGHTER:
    - If the user's scenario or flow is casual, humorous, or friendly: weave in subtle natural chuckles ("हाहा", "haha") and conversational warmth where it feels authentic.
-   - If the user's scenario is formal, business, or serious: maintain a confident, polite, and warmly modulated human tone without forced laughter.
-3. CONVERSATIONAL BREATHING: Keep turns concise and punchy (1 to 2 sentences per response). Use pauses ('...') between ideas so you sound like an authentic human speaking live.
-4. HANGING UP & CONCLUDING CALLS (CRITICAL):
-   - When the user says goodbye or thank you (e.g., "bye", "goodbye", "thank you", "okay bye", "चल ठीक है बाय", "रखता हूँ", "धन्यवाद"), or when the main purpose of the call is completed:
+   - If the user's scenario is formal, medical, business, or serious: maintain a confident, polite, and warmly modulated human tone without forced laughter.
+4. HANGING UP IMMEDIATELY AFTER FAREWELL (CRITICAL):
+   - When the caller says "thank you", "thanks", "bye", "goodbye", "that's all", or when the conversation concludes:
      Say a brief, polite farewell (e.g. "Thank you so much! Have a wonderful day, goodbye!" or "चल ठीक है भाई, अपना ध्यान रखना! बाय!") and call the 'end_call' function immediately to hang up the phone.
 """
     system_prompt = system_prompt + "\n\n" + speech_prosody_directive
-    initial_greeting = config_dict.get("first_message") or config.INITIAL_GREETING
-    fallback_greeting = config_dict.get("first_message") or getattr(config, "fallback_greeting", config.INITIAL_GREETING)
 
     # Initialize function context
     fnc_ctx = TransferFunctions(ctx, phone_number)
@@ -407,18 +470,27 @@ async def entrypoint(ctx: agents.JobContext):
         if transcript:
             logger.info(f"🗣️ [CALLER SAID]: '{transcript}'")
 
+    _user_said_bye = False
+
     @session.on("conversation_item_added")
     def _on_item_added(ev):
+        nonlocal _user_said_bye
         item = getattr(ev, "item", None)
         if item:
             role = getattr(item, "role", "")
             content = getattr(item, "text", "") or getattr(item, "content", "")
             logger.info(f"💬 [CONVERSATION] {role.upper()}: {content}")
 
-            # Auto-hangup when assistant speaks a farewell / goodbye / thank you closing
-            if role == "assistant" and content and _is_farewell_message(content):
-                logger.info(f"🛑 [VOICE AGENT] Farewell detected in speech ('{content}'). Cutting call on the spot...")
-                asyncio.create_task(_trigger_call_hangup(ctx, delay=2.5))
+            # If the user says goodbye or thank you, record it so the assistant's response triggers hangup
+            if role == "user" and content and _is_farewell_message(content):
+                logger.info(f"🛑 [VOICE AGENT] User initiated farewell: '{content}'")
+                _user_said_bye = True
+
+            # Auto-hangup when assistant speaks a farewell / goodbye / thank you closing, or replies to user's bye
+            if role == "assistant" and content:
+                if _user_said_bye or _is_farewell_message(content):
+                    logger.info(f"🛑 [VOICE AGENT] Farewell detected in speech ('{content}'). Cutting call on the spot...")
+                    asyncio.create_task(_trigger_call_hangup(ctx, delay=2.5))
 
     @session.on("error")
     def _on_session_error(ev):
