@@ -6,7 +6,20 @@ os.environ['SSL_CERT_FILE'] = certifi.where()
 
 import logging
 import json
+import inspect
+import aiohttp
 from dotenv import load_dotenv
+
+# Compatibility patch for aiohttp versions (< 3.11) where ClientSession.__init__ does not accept 'proxy'
+try:
+    if "proxy" not in inspect.signature(aiohttp.ClientSession.__init__).parameters:
+        _orig_client_session_init = aiohttp.ClientSession.__init__
+        def _patched_client_session_init(self, *args, **kwargs):
+            kwargs.pop("proxy", None)
+            return _orig_client_session_init(self, *args, **kwargs)
+        aiohttp.ClientSession.__init__ = _patched_client_session_init
+except Exception:
+    pass
 
 from livekit import agents, api
 from livekit.agents import AgentSession, Agent, RoomInputOptions
@@ -67,49 +80,48 @@ VOICE_PRESETS = {
 }
 
 
-def _build_tts(config_provider: str = None, config_voice: str = None, language: str = "hi", accent: str = "auto", speed: float = None):
+AARAV_VOICE_ID = "39d518b7-fd0b-4676-9b8b-29d64ff31e12"
+
+def _build_tts(
+    config_provider: str = None,
+    config_voice: str = None,
+    language: str = "hi",
+    accent: str = "auto",
+    speed: float = None,
+    emotion: list = None,
+):
     """
-    Configures Text-to-Speech per config.py:
-    - Hindi: Uses Cartesia Sonic-3 with Voice ID 39d518b7-fd0b-4676-9b8b-29d64ff31e12 and Speed 0.85
-    - US Accent: Uses Cartesia Sonic-3 with Voice ID 248be419-c632-4f23-add1-07c49495163f and Speed 1.0
+    Configures Text-to-Speech:
+    Enforces Cartesia Sonic-3 with Aarav Voice ID (39d518b7-fd0b-4676-9b8b-29d64ff31e12).
+    Pitch, prosody, and emotional intonation are driven dynamically by the text transcript.
     """
-    lang = (language or "hi").lower().split("-")[0]
-    acc = (accent or "").lower()
+    model = os.getenv("CARTESIA_TTS_MODEL", getattr(config, "CARTESIA_MODEL", "sonic-3"))
+    
+    # Strictly enforce Cartesia Aarav voice ID
+    voice = AARAV_VOICE_ID
+    if config_voice and len(config_voice.strip()) >= 32 and "-" in config_voice:
+        voice = config_voice.strip()
 
-    provider = (config_provider or os.getenv("TTS_PROVIDER", config.DEFAULT_TTS_PROVIDER)).lower()
+    tts_speed = speed if speed is not None else float(getattr(config, "CARTESIA_SPEED", 0.88))
+    tts_lang = "hi" if (not language or language.lower().startswith("hi") or (accent and accent.lower() in ["in", "indian", "auto"])) else "en"
 
-    if provider == "cartesia":
-        model = os.getenv("CARTESIA_TTS_MODEL", config.CARTESIA_MODEL)
-        if lang == "hi" or acc in ["in", "indian"]:
-            voice = config_voice or getattr(config, "CARTESIA_VOICE", "39d518b7-fd0b-4676-9b8b-29d64ff31e12")
-            tts_speed = speed if speed is not None else float(getattr(config, "CARTESIA_SPEED", 0.85))
-            tts_lang = "hi"
-        else:
-            voice = config_voice or "248be419-c632-4f23-add1-07c49495163f"
-            tts_speed = speed if speed is not None else 1.0
-            tts_lang = "en"
+    logger.info("=" * 65)
+    logger.info(f"🔊 [VOICE AGENT TTS] Engine: Cartesia {model}")
+    logger.info(f"🎙️ [VOICE AGENT TTS] Voice: Aarav ({voice})")
+    logger.info(f"⚡ [VOICE AGENT TTS] Language: {tts_lang} | Speed: {tts_speed}x | Dynamic Prosody: Active")
+    logger.info("=" * 65)
 
-        logger.info(f"Using Cartesia TTS (Model: {model}, Lang: {tts_lang}, Voice: {voice}, Speed: {tts_speed})")
-        return cartesia.TTS(model=model, voice=voice, language=tts_lang, speed=float(tts_speed))
+    tts_kwargs = {
+        "model": model,
+        "voice": voice,
+        "language": tts_lang,
+        "speed": float(tts_speed),
+    }
+    # Dynamic emotion: only applied if explicitly requested, otherwise driven naturally by the user's transcript
+    if emotion:
+        tts_kwargs["emotion"] = emotion
 
-    if provider == "sarvam" and sarvam is not None:
-        voice = config_voice or "karun"
-        logger.info(f"Using Sarvam TTS for Indian Voice: {voice}")
-        model = os.getenv("SARVAM_TTS_MODEL", config.SARVAM_MODEL)
-        return sarvam.TTS(model=model, speaker=voice, target_language_code="hi-IN")
-
-    if provider == "deepgram":
-        logger.info(f"Using Deepgram TTS (US English Aura)")
-        model = config_voice or os.getenv("DEEPGRAM_TTS_MODEL", "aura-asteria-en")
-        return deepgram.TTS(model=model)
-
-    # Fallback to OpenAI
-    model = os.getenv("OPENAI_TTS_MODEL", "tts-1")
-    voice = config_voice or "alloy"
-    if voice not in ["nova", "shimmer", "echo", "onyx", "fable", "alloy", "ash", "sage", "coral"]:
-        voice = "alloy"
-    logger.info(f"Using OpenAI TTS (Voice: {voice})")
-    return openai.TTS(model=model, voice=voice)
+    return cartesia.TTS(**tts_kwargs)
 
 
 
@@ -206,6 +218,57 @@ class TransferFunctions(llm.ToolContext):
             logger.error(f"Transfer failed: {e}")
             return f"Error executing transfer: {e}"
 
+    @llm.function_tool(description="Immediately end and hang up the phone call after concluding the conversation, saying goodbye, or if the user asks to hang up.")
+    async def end_call(self):
+        """
+        Immediately hang up and terminate the phone call.
+        """
+        logger.info("🛑 [VOICE AGENT TOOL] 'end_call' invoked. Hanging up call...")
+        asyncio.create_task(_trigger_call_hangup(self.ctx, delay=2.5))
+        return "Call is disconnecting now. Goodbye."
+
+
+_hangup_triggered = False
+
+def _is_farewell_message(text: str) -> bool:
+    """Detects whether a speech turn is a farewell, goodbye, or call conclusion."""
+    if not text:
+        return False
+    import re
+    lower = text.lower()
+    eng_patterns = r"\b(goodbye|good bye|bye bye|bye-bye|bye|have a (great|good|nice|wonderful) day|take care|talk soon|have a good one)\b"
+    if re.search(eng_patterns, lower):
+        return True
+    hindi_keywords = ["अलविदा", "बाय", "बाय-बाय", "बाय बाय", "फिर मिलेंगे", "अच्छा बाय", "ओके बाय", "चल बाय"]
+    return any(k in lower for k in hindi_keywords)
+
+
+async def _trigger_call_hangup(ctx: agents.JobContext, delay: float = 2.5):
+    """
+    Terminates the LiveKit SIP call cleanly after allowing the final farewell speech audio to complete.
+    """
+    global _hangup_triggered
+    if _hangup_triggered:
+        return
+    _hangup_triggered = True
+
+    logger.info("=" * 65)
+    logger.info(f"🛑 [VOICE AGENT HANGUP] Farewell concluded. Ending call in {delay}s...")
+    logger.info("=" * 65)
+
+    await asyncio.sleep(delay)
+
+    logger.info(f"📞 [VOICE AGENT] Cutting call now (delete_room: {ctx.room.name})!")
+    try:
+        await ctx.delete_room()
+    except Exception as e:
+        logger.warning(f"delete_room notice ({e})")
+    try:
+        await ctx.room.disconnect()
+    except Exception:
+        pass
+    ctx.shutdown()
+
 
 class OutboundAssistant(Agent):
     """
@@ -266,6 +329,27 @@ async def entrypoint(ctx: agents.JobContext):
     system_prompt = config_dict.get("system_prompt") or config_dict.get("prompt") or config.SYSTEM_PROMPT
     if lead_name:
         system_prompt = f"The person you are calling is {lead_name}.\n\n" + system_prompt
+
+    global _hangup_triggered
+    _hangup_triggered = False
+
+    # Dynamic human speech prosody & pitch inflection guidelines:
+    # Adapts automatically to ANY user prompt/persona (sales, support, casual, formal) without fixed emotions
+    speech_prosody_directive = """
+# SPEECH PROSODY & DYNAMIC HUMAN VOCAL DYNAMICS (MANDATORY):
+1. DYNAMIC PITCH & INTONATION: Never speak in a flat, monotone, or robotic manner. Modulate your pitch dynamically to fit your specific role and the conversation:
+   - High Pitch / Energy: Use '!' on enthusiastic greetings, key highlights, or warm affirmations.
+   - Rising Question Pitch: Always end questions with '?' so your pitch lifts naturally at the end of clauses.
+   - Low Pitch & Thoughtful Pauses: Use '...' or commas (',') for natural breath pauses and calm transitions.
+2. CONTEXTUAL WARMTH & LAUGHTER:
+   - If the user's scenario or flow is casual, humorous, or friendly: weave in subtle natural chuckles ("हाहा", "haha") and conversational warmth where it feels authentic.
+   - If the user's scenario is formal, business, or serious: maintain a confident, polite, and warmly modulated human tone without forced laughter.
+3. CONVERSATIONAL BREATHING: Keep turns concise and punchy (1 to 2 sentences per response). Use pauses ('...') between ideas so you sound like an authentic human speaking live.
+4. HANGING UP & CONCLUDING CALLS (CRITICAL):
+   - When the user says goodbye or thank you (e.g., "bye", "goodbye", "thank you", "okay bye", "चल ठीक है बाय", "रखता हूँ", "धन्यवाद"), or when the main purpose of the call is completed:
+     Say a brief, polite farewell (e.g. "Thank you so much! Have a wonderful day, goodbye!" or "चल ठीक है भाई, अपना ध्यान रखना! बाय!") and call the 'end_call' function immediately to hang up the phone.
+"""
+    system_prompt = system_prompt + "\n\n" + speech_prosody_directive
     initial_greeting = config_dict.get("first_message") or config.INITIAL_GREETING
     fallback_greeting = config_dict.get("first_message") or getattr(config, "fallback_greeting", config.INITIAL_GREETING)
 
@@ -304,9 +388,41 @@ async def entrypoint(ctx: agents.JobContext):
             language=call_language,
             accent=call_accent,
             speed=config_dict.get("speed"),
+            emotion=config_dict.get("emotion"),
         ),
     )
 
+    # Register real-time dialogue and speech telemetry listeners
+    @session.on("user_state_changed")
+    def _on_user_state(ev):
+        logger.info(f"🎤 [VOICE AGENT] Caller is now: {getattr(ev, 'new_state', ev)}")
+
+    @session.on("agent_state_changed")
+    def _on_agent_state(ev):
+        logger.info(f"🤖 [VOICE AGENT] AI Agent is now: {getattr(ev, 'new_state', ev)}")
+
+    @session.on("user_input_transcribed")
+    def _on_transcribed(ev):
+        transcript = getattr(ev, "transcript", "")
+        if transcript:
+            logger.info(f"🗣️ [CALLER SAID]: '{transcript}'")
+
+    @session.on("conversation_item_added")
+    def _on_item_added(ev):
+        item = getattr(ev, "item", None)
+        if item:
+            role = getattr(item, "role", "")
+            content = getattr(item, "text", "") or getattr(item, "content", "")
+            logger.info(f"💬 [CONVERSATION] {role.upper()}: {content}")
+
+            # Auto-hangup when assistant speaks a farewell / goodbye / thank you closing
+            if role == "assistant" and content and _is_farewell_message(content):
+                logger.info(f"🛑 [VOICE AGENT] Farewell detected in speech ('{content}'). Cutting call on the spot...")
+                asyncio.create_task(_trigger_call_hangup(ctx, delay=2.5))
+
+    @session.on("error")
+    def _on_session_error(ev):
+        logger.error(f"❌ [VOICE AGENT ERROR]: {ev}")
 
     # Start the session
     await session.start(
@@ -499,17 +615,21 @@ async def entrypoint(ctx: agents.JobContext):
                 ctx.shutdown()
     else:
         # User is already joining/joined via SIP trunk dispatched by backend
-        logger.info("SIP participant dispatched by backend. Waiting for participant to answer...")
+        logger.info(f"⏳ [VOICE AGENT] Room {ctx.room.name}: Waiting for lead ({phone_number}) to answer phone...")
         try:
             participant = await asyncio.wait_for(ctx.wait_for_participant(), timeout=60.0)
             call_connected = True
             import datetime
             call_start_time = datetime.datetime.now(datetime.UTC)
-            logger.info(f"Participant joined/answered: {participant.identity}. Delivering initial greeting via TTS...")
+            logger.info("=" * 65)
+            logger.info(f"🎉 [VOICE AGENT] PHONE ANSWERED! Connected to {participant.identity}")
+            logger.info(f"🔊 [VOICE AGENT] Speaking Opening Greeting: '{initial_greeting}'")
+            logger.info("=" * 65)
             try:
                 await session.say(initial_greeting)
+                logger.info("✅ [VOICE AGENT] Opening greeting audio delivered successfully.")
             except Exception as say_err:
-                logger.warning(f"session.say error ({say_err}), fallback to generate_reply...")
+                logger.warning(f"session.say notice ({say_err}), fallback to generate_reply...")
                 await session.generate_reply(instructions=initial_greeting)
         except Exception as e:
             logger.warning(f"wait_for_participant notice ({e}). Delivering fallback greeting...")

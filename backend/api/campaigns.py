@@ -1017,7 +1017,10 @@ async def test_voice_call(req: VoiceTestCallRequest):
     if not req.phone:
         raise HTTPException(status_code=400, detail="Phone number is required for test call")
 
-    tts_provider = "sarvam" if req.language.startswith("hi") else "cartesia"
+    # Strictly enforce Cartesia TTS provider and Aarav voice ID (39d518b7-fd0b-4676-9b8b-29d64ff31e12)
+    tts_provider = "cartesia"
+    aarav_voice_id = "39d518b7-fd0b-4676-9b8b-29d64ff31e12"
+    tts_voice = req.voice_id.strip() if (req.voice_id and len(req.voice_id.strip()) >= 32 and "-" in req.voice_id) else aarav_voice_id
 
     room_name, status = await dispatch_livekit_call(
         phone=req.phone,
@@ -1029,7 +1032,7 @@ async def test_voice_call(req: VoiceTestCallRequest):
         language=req.language or "auto",
         accent=req.accent or "auto",
         tts_provider=tts_provider,
-        tts_voice=req.voice_id,
+        tts_voice=tts_voice,
         telephony_provider=req.telephony_provider or "auto",
     )
 
@@ -1399,60 +1402,6 @@ async def preview_voice_audio(req: VoiceAudioPreviewRequest):
     except Exception as e:
         logger.error(f"Error synthesizing voice preview: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.post("/voice/test-call")
-async def test_voice_call(req: VoiceTestCallRequest):
-    """
-    Rings the user's test phone number immediately to test the voice prompt,
-    accent, and opening greeting in real time.
-    """
-    if not req.phone:
-        raise HTTPException(status_code=400, detail="Phone number is required for test call")
-
-    from services.livekit_service import dispatch_livekit_call
-    room_name, status = await dispatch_livekit_call(
-        phone=req.phone,
-        lead_name="Test Prospect",
-        system_prompt=req.prompt,
-        first_message=req.first_message,
-        user_id=req.user_id,
-        campaign_id="test-call-direct",
-        language=req.language or "auto",
-        accent=req.accent or "auto",
-        tts_provider=req.tts_provider or "",
-        tts_voice=req.voice_id or "",
-    )
-
-    if not room_name:
-        raise HTTPException(status_code=500, detail=f"Failed to initiate test call: {status}")
-
-    # Log the test call in database
-    call_log = {
-        "user_id": req.user_id,
-        "campaign_id": "test-call-direct",
-        "call_id": room_name,
-        "provider": "livekit",
-        "lead_name": "Test Prospect",
-        "lead_phone": req.phone,
-        "status": "in-progress",
-        "transcript": "",
-        "recording_url": "",
-        "summary": "Direct browser test call",
-        "checklist": [],
-        "sentiment": "Neutral",
-        "sms_status": "",
-        "sms_content": "",
-        "duration": 0,
-        "created_at": datetime.datetime.utcnow(),
-    }
-    await save_call_log(call_log)
-
-    return {
-        "status": "success",
-        "room_name": room_name,
-        "message": f"Dialing test call to {req.phone} with {req.language or 'auto'} language and {req.accent or 'auto'} accent...",
-    }
 
 
 @router.post("/voice/livekit-webhook")

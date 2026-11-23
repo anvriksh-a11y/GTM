@@ -42,7 +42,7 @@ export default function Campaigns() {
   // Voice Campaign State
   const [voiceRawPrompt, setVoiceRawPrompt] = useState('');
   const [voiceRefinedPrompt, setVoiceRefinedPrompt] = useState('');
-  const [voiceFirstMessage, setVoiceFirstMessage] = useState('Hello! Thanks for taking my call.');
+  const [voiceFirstMessage, setVoiceFirstMessage] = useState('अरे हेलो भाई! हाहा, मैं नरेश बोल रहा हूँ... और सुना यार, क्या हाल-चाल तेरे?');
   const [isRefiningPrompt, setIsRefiningPrompt] = useState(false);
   const [sendFollowupSms, setSendFollowupSms] = useState(true);
   const [selectedLeadPhones, setSelectedLeadPhones] = useState<Set<string>>(new Set());

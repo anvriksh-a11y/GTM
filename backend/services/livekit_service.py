@@ -140,23 +140,21 @@ async def dispatch_livekit_call(
     if resolved_accent == "auto":
         resolved_accent = "in" if (resolved_lang == "hi" or is_indian_number) else "us"
 
-    # Select TTS provider, voice, and speed based on config.py defaults
-    chosen_provider = (tts_provider or os.getenv("TTS_PROVIDER", "cartesia")).lower()
-    chosen_voice = tts_voice
-
-    if resolved_lang == "hi" or resolved_accent in ["in", "indian"]:
-        chosen_voice = chosen_voice or "39d518b7-fd0b-4676-9b8b-29d64ff31e12"
-        chosen_speed = 0.85
+    # Select TTS provider, voice, and speed (Defaulting strictly to Cartesia Aarav)
+    chosen_provider = "cartesia"
+    aarav_voice_id = "39d518b7-fd0b-4676-9b8b-29d64ff31e12"
+    if tts_voice and len(tts_voice.strip()) >= 32 and "-" in tts_voice:
+        chosen_voice = tts_voice.strip()
     else:
-        chosen_voice = chosen_voice or "248be419-c632-4f23-add1-07c49495163f"
-        chosen_speed = 1.0
+        chosen_voice = aarav_voice_id
+    chosen_speed = 0.85
 
     greeting = first_message
     if not greeting:
         if resolved_lang == "hi":
-            greeting = f"नमस्ते {lead_name}! बात करने के लिए धन्यवाद।"
+            greeting = f"अरे हेलो {lead_name}! हाहा, मैं नरेश बोल रहा हूँ... और सुना यार, क्या हाल-चाल तेरे?"
         else:
-            greeting = f"Hello {lead_name}! Thanks for taking my call."
+            greeting = f"Hey {lead_name}! Haha, glad I caught you... how's everything going with you today?"
 
     # Look up user's telephony integrations (Vobiz for India, Twilio for International)
     user_doc = None

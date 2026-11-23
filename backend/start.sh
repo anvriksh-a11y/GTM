@@ -4,6 +4,7 @@ set -e
 echo "=== Starting Genquantaa GTM OS Production Container ==="
 
 # Start the LiveKit Voice Agent worker in the background
+export VOICE_AGENT_SPAWNED=1
 echo "[Voice Agent] Starting LiveKit outbound caller daemon..."
 python voice_agent/agent.py dev &
 

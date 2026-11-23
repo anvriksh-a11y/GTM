@@ -29,6 +29,9 @@ from slowapi.errors import RateLimitExceeded
 
 from services.background_poller import background_email_poller, background_whatsapp_bot_poller
 import asyncio
+import os
+import sys
+import subprocess
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -37,9 +40,32 @@ async def lifespan(app: FastAPI):
     # Start the background email & WhatsApp polling tasks
     polling_task = asyncio.create_task(background_email_poller())
     wa_polling_task = asyncio.create_task(background_whatsapp_bot_poller())
+
+    # Auto-spawn LiveKit Voice Agent worker daemon if not already spawned by start.sh
+    voice_proc = None
+    if not os.environ.get("VOICE_AGENT_SPAWNED"):
+        try:
+            from config import settings
+            if getattr(settings, "LIVEKIT_URL", None):
+                backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                agent_script = os.path.join(backend_dir, "voice_agent", "agent.py")
+                if os.path.exists(agent_script):
+                    logging.info("🎙️ Spawning local LiveKit Voice Agent worker daemon (agent.py dev)...")
+                    voice_proc = subprocess.Popen(
+                        [sys.executable, agent_script, "dev"],
+                        cwd=backend_dir,
+                        env=os.environ.copy()
+                    )
+        except Exception as e:
+            logging.warning(f"Could not auto-spawn Voice Agent worker: {e}")
     
     yield
     
+    if voice_proc:
+        try:
+            voice_proc.terminate()
+        except Exception:
+            pass
     polling_task.cancel()
     wa_polling_task.cancel()
     close_mongo_connection()
